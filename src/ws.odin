@@ -176,6 +176,11 @@ ws_serve :: proc(sock: net.TCP_Socket) {
 		frame, ok := read_frame(sock)
 		if !ok do return
 
+		// ANY inbound frame proves liveness. Not every client library
+		// auto-pongs (Bun's WebSocket doesn't) - an actively publishing
+		// connection must never be reaped for missing pongs alone.
+		c.last_pong = unix_now()
+
 		switch frame.op {
 		case .Ping:
 			if !ws_send(c, .Pong, frame.payload) do return
@@ -243,11 +248,14 @@ ping_loop :: proc() {
 		now := unix_now()
 		sync.lock(&g_conns_mu)
 		for c in g_conns {
-			if now - c.last_pong > PONG_DEADLINE {
+			// Reap only when BOTH silence and a failed ping write agree -
+			// idle-but-healthy clients (not every library auto-pongs) keep
+			// their subscriptions; genuinely dead sockets fail the send
+			// (10s timeout) or have long-stale traffic.
+			ping_ok := ws_send(c, .Ping, {})
+			if !ping_ok && now - c.last_pong > PONG_DEADLINE {
 				net.shutdown(c.sock, .Both)
-				continue
 			}
-			ws_send(c, .Ping, {})
 		}
 		sync.unlock(&g_conns_mu)
 	}
