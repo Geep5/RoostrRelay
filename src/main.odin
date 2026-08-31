@@ -45,6 +45,7 @@ main :: proc() {
 
 	verify_init()
 	store_open(db_path)
+	refresh_dynamic_allowlist()
 
 	endpoint := net.Endpoint{address = net.IP4_Address{0, 0, 0, 0}, port = port}
 	sock, err := net.listen_tcp(endpoint)

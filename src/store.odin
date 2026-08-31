@@ -349,3 +349,60 @@ query_filter :: proc(f: ^Filter) -> []Stored_Event {
 	sqlite3_finalize(stmt)
 	return out[:]
 }
+
+// -- Dynamic allowlist (kind 30100 "roostr-allowlist") ----------------
+//
+// Resident (env-allowlisted) keys administer extra writer pubkeys by
+// publishing an addressable kind-30100 event whose p-tags list them:
+// space members get relay write access without a redeploy. The set is
+// the union across resident authors; refreshed at startup and whenever
+// a resident stores a fresh 30100.
+
+ALLOWLIST_KIND :: 30100
+
+g_dynamic: map[string]bool
+g_dynamic_mu: sync.Mutex
+
+write_allowed :: proc(pubkey: string) -> bool {
+	if pubkey in g_allowed do return true
+	sync.lock(&g_dynamic_mu)
+	defer sync.unlock(&g_dynamic_mu)
+	return pubkey in g_dynamic
+}
+
+refresh_dynamic_allowlist :: proc() {
+	next := make(map[string]bool)
+	{
+		sync.lock(&g_db_mu)
+		defer sync.unlock(&g_db_mu)
+		stmt, pok := prep("SELECT pubkey, tags FROM events WHERE kind = ?")
+		if !pok do return
+		sqlite3_bind_int64(stmt, 1, ALLOWLIST_KIND)
+		for sqlite3_step(stmt) == SQLITE_ROW {
+			author := strings.clone_from_cstring(sqlite3_column_text(stmt, 0), context.temp_allocator)
+			if !(author in g_allowed) do continue
+			tags_json := strings.clone_from_cstring(sqlite3_column_text(stmt, 1), context.temp_allocator)
+			// Parse [["p","<hex>"],...] without a JSON dependency: scan for
+			// 64-char lowercase-hex strings following a "p" element.
+			rest := tags_json
+			for {
+				idx := strings.index(rest, `["p","`)
+				if idx < 0 do break
+				rest = rest[idx + 6:]
+				if len(rest) >= 64 && is_hex64(rest[:64]) {
+					next[strings.clone(rest[:64])] = true
+				}
+			}
+		}
+		sqlite3_finalize(stmt)
+	}
+	sync.lock(&g_dynamic_mu)
+	old := g_dynamic
+	g_dynamic = next
+	sync.unlock(&g_dynamic_mu)
+	if old != nil {
+		for k, _ in old do delete_key(&old, k)
+		delete(old)
+	}
+	fmt.printfln("[relay] dynamic allowlist: %d pubkey(s)", len(next))
+}

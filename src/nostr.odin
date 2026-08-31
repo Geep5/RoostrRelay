@@ -367,9 +367,24 @@ handle_event :: proc(c: ^Conn, v: json.Value) {
 	}
 
 	// Policy before crypto: cheap checks first.
-	if len(g_allowed) > 0 && !(ev.pubkey in g_allowed) {
-		send_ok(c, ev.id, false, "restricted: pubkey not on the allowlist")
-		return
+	// Strangers get two doors: (1) kind-1059 gift wraps ADDRESSED (p-tag)
+	// to a resident pubkey - that's how join requests reach the owner -
+	// and (2) membership in the dynamic allowlist, which resident keys
+	// administer by publishing kind-30100 "roostr-allowlist" events.
+	if len(g_allowed) > 0 && !write_allowed(ev.pubkey) {
+		wrap_ok := false
+		if ev.kind == 1059 {
+			for tag in ev.tags {
+				if len(tag) >= 2 && tag[0] == "p" && write_allowed(tag[1]) {
+					wrap_ok = true
+					break
+				}
+			}
+		}
+		if !wrap_ok {
+			send_ok(c, ev.id, false, "restricted: pubkey not on the allowlist")
+			return
+		}
 	}
 	if len(ev.content) > MAX_CONTENT {
 		send_ok(c, ev.id, false, "invalid: content too large")
@@ -403,6 +418,9 @@ handle_event :: proc(c: ^Conn, v: json.Value) {
 			return
 		}
 		stored_msg = msg
+		if ev.kind == ALLOWLIST_KIND && (ev.pubkey in g_allowed) {
+			refresh_dynamic_allowlist()
+		}
 	}
 
 	send_ok(c, ev.id, true, stored_msg)
