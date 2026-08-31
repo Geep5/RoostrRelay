@@ -437,14 +437,17 @@ handle_req :: proc(c: ^Conn, sub_id: string, filter_values: []json.Value) {
 		return
 	}
 
-	// Parse into the sub's own arena so the filters outlive this message.
+	// Parse in the message arena, then DEEP-CLONE into the sub's own
+	// arena. The parsed strings reference the JSON tree of THIS message,
+	// which ws_serve frees after dispatch - a registered filter keeping
+	// those pointers matches garbage as soon as the connection handles
+	// its next message (exactly what a busy pool connection does).
 	sub: Sub
 	mem.dynamic_arena_init(&sub.arena)
 	sub_alloc := mem.dynamic_arena_allocator(&sub.arena)
 
 	{
-		context.temp_allocator = sub_alloc
-		filters := make([]Filter, len(filter_values), sub_alloc)
+		filters := make([]Filter, len(filter_values), context.temp_allocator)
 		ok := true
 		for v, i in filter_values {
 			f, fok := parse_filter(v)
@@ -459,7 +462,7 @@ handle_req :: proc(c: ^Conn, sub_id: string, filter_values: []json.Value) {
 			send_closed(c, sub_id, "invalid: bad filter")
 			return
 		}
-		sub.filters = filters
+		sub.filters = clone_filters(filters, sub_alloc)
 	}
 
 	// Serve stored events, newest first, deduped across filters.
@@ -493,14 +496,47 @@ handle_req :: proc(c: ^Conn, sub_id: string, filter_values: []json.Value) {
 	if had_old do mem.dynamic_arena_destroy(&old.arena)
 }
 
+clone_strs :: proc(src: []string, allocator: mem.Allocator) -> []string {
+	out := make([]string, len(src), allocator)
+	for s, i in src do out[i] = strings.clone(s, allocator)
+	return out
+}
+
+clone_filters :: proc(filters: []Filter, allocator: mem.Allocator) -> []Filter {
+	out := make([]Filter, len(filters), allocator)
+	for f, i in filters {
+		nf := f
+		nf.ids = clone_strs(f.ids, allocator)
+		nf.authors = clone_strs(f.authors, allocator)
+		nf.kinds = make([]i64, len(f.kinds), allocator)
+		copy(nf.kinds, f.kinds)
+		nf.tags = make([]Tag_Filter, len(f.tags), allocator)
+		for tf, j in f.tags {
+			nf.tags[j] = Tag_Filter{name = strings.clone(tf.name, allocator), values = clone_strs(tf.values, allocator)}
+		}
+		out[i] = nf
+	}
+	return out
+}
+
 // Push a freshly accepted event to every matching open subscription.
 broadcast :: proc(ev: ^Event) {
 	ev_js := event_json(ev)
 	sync.lock(&g_conns_mu)
 	defer sync.unlock(&g_conns_mu)
+	when #config(RELAY_TRACE, false) {
+		fmt.eprintfln("[trace] broadcast kind=%d conns=%d", ev.kind, len(g_conns))
+	}
 	for c in g_conns {
 		for sub_id, &sub in c.subs {
-			if match_any(sub.filters, ev) {
+			matched := match_any(sub.filters, ev)
+			when #config(RELAY_TRACE, false) {
+				fmt.eprintfln("[trace] sub %s filters=%d matched=%v", sub_id, len(sub.filters), matched)
+				for f in sub.filters {
+					fmt.eprintfln("[trace]   kinds=%v tags=%v since=%d", f.kinds, f.tags, f.since)
+				}
+			}
+			if matched {
 				send_event(c, sub_id, ev_js)
 			}
 		}
