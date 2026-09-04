@@ -367,21 +367,23 @@ handle_event :: proc(c: ^Conn, v: json.Value) {
 	}
 
 	// Policy before crypto: cheap checks first.
-	// Strangers get two doors: (1) kind-1059 gift wraps ADDRESSED (p-tag)
+	// Strangers get three doors: (1) kind-1059 gift wraps ADDRESSED (p-tag)
 	// to a resident pubkey - that's how join requests reach the owner -
-	// and (2) membership in the dynamic allowlist, which resident keys
-	// administer by publishing kind-30100 "roostr-allowlist" events.
+	// (2) their own kind-0 profile, so the owner sees a name and avatar
+	// beside the knock (replaceable: one row per pubkey, size-capped like
+	// everything else), and (3) membership in the dynamic allowlist, which
+	// resident keys administer via kind-30100 "roostr-allowlist" events.
 	if len(g_allowed) > 0 && !write_allowed(ev.pubkey) {
-		wrap_ok := false
+		stranger_ok := ev.kind == 0
 		if ev.kind == 1059 {
 			for tag in ev.tags {
 				if len(tag) >= 2 && tag[0] == "p" && write_allowed(tag[1]) {
-					wrap_ok = true
+					stranger_ok = true
 					break
 				}
 			}
 		}
-		if !wrap_ok {
+		if !stranger_ok {
 			send_ok(c, ev.id, false, "restricted: pubkey not on the allowlist")
 			return
 		}
