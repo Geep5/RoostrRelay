@@ -3,7 +3,7 @@ primary_region = "sjc"
 
 [build]
   [build.args]
-    VERIFY_DUAL = "true" # Production soak: both verifiers must agree before acceptance.
+    VERIFY_DUAL = "false" # Pure-Odin production verifier; enable true for differential diagnosis.
 
 [env]
   PORT = "7777"

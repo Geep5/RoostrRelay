@@ -53,12 +53,12 @@ and accepts public inputs only; it must not be reused for signing or secrets.
 The binary verifier accepts arbitrary message bytes; the Nostr adapter requires
 a 32-byte event ID, 32-byte x-only public key, and 64-byte signature in hex.
 
-Production currently selects `VERIFY_DUAL=true` through `fly.toml`: every
-signature is checked by both Odin and libsecp256k1. A disagreement logs
-`VERIFIER DISAGREEMENT` and rejects the event. Default local builds use Odin
-alone. Keep the production oracle during the soak; absence of test failures
-is not a cryptographic audit. Switching production to pure-only is an explicit
-change to that build argument after reviewing soak logs.
+Production and default local builds select pure Odin (`VERIFY_DUAL=false`).
+Set `VERIFY_DUAL=true` in `fly.toml` to restore differential diagnosis: both
+Odin and libsecp256k1 check each signature, and any disagreement logs
+`VERIFIER DISAGREEMENT` and rejects the event. Production switched to pure-only
+for user testing before an extended dual-mode soak completed. Passing vectors
+and differential tests is not a cryptographic audit.
 
 Deploy: `fly deploy --remote-only`. The Dockerfile builds libsecp256k1 v0.6.0
 only when `VERIFY_DUAL=true`; the default image build needs neither C library.
@@ -71,7 +71,7 @@ The runtime is debian-slim with one relay binary.
 odin test src -o:speed
 # Deterministic differential oracle, requires libsecp256k1 with schnorrsig:
 odin test src -o:speed -define:VERIFY_DIFFERENTIAL=true
-# Also exercise the production dual-mode adapter:
+# Also exercise the optional dual-mode adapter:
 odin test src -o:speed -define:VERIFY_DIFFERENTIAL=true -define:VERIFY_DUAL=true
 ```
 
