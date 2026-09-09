@@ -325,4 +325,68 @@ when ODIN_TEST {
 		n, _ := net.recv_tcp(client, probe[:])
 		testing.expectf(t, n == 0, "Overflow stops the sender without emitting queued frames")
 	}
+
+	@(test)
+	ws_queue_ring_growth :: proc(t: ^testing.T) {
+		c := Conn{allocator = context.allocator}
+		defer ws_queue_discard(&c)
+		testing.expect_value(t, len(c.outbound), 0)
+		// Fill the initial capacity exactly, then wrap the head.
+		for i in 0 ..< OUTBOUND_INITIAL_CAPACITY {
+			testing.expect(t, ws_send(&c, .Text, []byte{byte(i)}))
+		}
+		testing.expect_value(t, len(c.outbound), OUTBOUND_INITIAL_CAPACITY)
+		for i in 0 ..< 16 {
+			frame := ws_queue_pop(&c)
+			testing.expect_value(t, frame[2], byte(i))
+			c.out_bytes -= len(frame)
+			delete(frame, c.allocator)
+		}
+		// Growth from a wrapped head must preserve queue order.
+		for i in OUTBOUND_INITIAL_CAPACITY ..< OUTBOUND_INITIAL_CAPACITY + 80 {
+			testing.expect(t, ws_send(&c, .Text, []byte{byte(i)}))
+		}
+		testing.expect_value(t, len(c.outbound), 2 * OUTBOUND_INITIAL_CAPACITY)
+		testing.expect_value(t, c.out_count, 48 + 80)
+		for i in 16 ..< OUTBOUND_INITIAL_CAPACITY + 80 {
+			frame := ws_queue_pop(&c)
+			testing.expect_value(t, frame[2], byte(i))
+			c.out_bytes -= len(frame)
+			delete(frame, c.allocator)
+		}
+		testing.expect(t, c.out_count == 0 && c.out_bytes == 0)
+		testing.expect_value(t, c.out_head, 0)
+	}
+
+	@(test)
+	ws_queue_ring_frame_cap :: proc(t: ^testing.T) {
+		c := Conn{allocator = context.allocator}
+		defer ws_queue_discard(&c)
+		for _ in 0 ..< MAX_OUTBOUND_FRAMES do testing.expect(t, ws_send(&c, .Ping, {}))
+		testing.expect_value(t, len(c.outbound), MAX_OUTBOUND_FRAMES)
+		testing.expect_value(t, c.out_count, MAX_OUTBOUND_FRAMES)
+		testing.expect(t, !ws_send(&c, .Ping, {}), "The frame count cap still rejects at the grown boundary")
+		testing.expect(t, c.stopping)
+		testing.expect_value(t, c.out_count, MAX_OUTBOUND_FRAMES)
+	}
+
+	@(test)
+	ws_recv_timeout_is_clean_close :: proc(t: ^testing.T) {
+		client, server, pair_ok := ws_test_pair(t)
+		if !pair_ok do return
+		defer net.close(client)
+		defer net.close(server)
+		net.set_option(server, .Receive_Timeout, 50 * time.Millisecond)
+		c := Conn{sock = server, allocator = context.allocator}
+		defer ws_queue_discard(&c)
+		state: WS_Assembly
+		defer ws_assembly_reset(&state)
+		// A silent peer times out like EOF: no log, no panic, clean teardown.
+		keep, flush := ws_read_step(&c, &state)
+		testing.expect(t, !keep && !flush)
+		// A timeout halfway through a frame header takes the same path.
+		testing.expect(t, send_all(client, []byte{0x81}))
+		keep, flush = ws_read_step(&c, &state)
+		testing.expect(t, !keep && !flush)
+	}
 }

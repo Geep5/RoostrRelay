@@ -5,7 +5,9 @@ package relay
 // operation: its authorized deletions/supersession and insertion replay together.
 // Framing: [type:u8][length:u32le][payload][crc32:u32le]. A checksums header
 // plus payload; legacy E/T checksum only payload, exactly as before.
-// Incomplete EOF is recoverable; corrupt complete records are never discarded.
+// An incomplete EOF tail is always truncated at boot (bytes past a torn
+// append are untrustworthy, even if a suffix decodes as a valid frame);
+// corrupt complete records are never discarded.
 // g_mu owns the file, append-failure latch and all in-memory indexes.
 
 import "core:encoding/json"
@@ -32,15 +34,26 @@ Stored :: struct {
 	d:          string, // addressable identity ("" otherwise)
 	tags:       [][2]string, // single-letter tags only (the indexed set)
 	json:       string, // wire JSON, echoed verbatim by REQ
+	anon:       bool, // admitted via the stranger doors, counts against g_anon_bytes
 	idx:        int, // position in g_order (swap-remove bookkeeping)
 }
 
 g_events: map[string]^Stored
 g_order: [dynamic]^Stored
 g_tombs: int // tombstoned records currently wasting log bytes
+g_anon_bytes: int // retained wire bytes from anonymous (non-allowlisted) writers
+
+// Stranger retention quotas. The per-event size fence lives in nostr.odin
+// (ANON_MAX_EVENT_BYTES); these bound the aggregate: kind-0 rotation across
+// fresh keys and gift-wrap floods cannot grow the log past this, and any one
+// recipient keeps at most ANON_MAX_GIFTS_PER_TARGET kind-1059 envelopes
+// (further anonymous gifts are REJECTED, none are evicted).
+ANON_MAX_TOTAL_BYTES :: 32 << 20
+ANON_MAX_GIFTS_PER_TARGET :: 64
 
 MAX_RECORD :: MAX_MESSAGE // same bound for acceptance, new writes and legacy replay
 COMPACT_MIN_TOMBS :: 1024
+MAX_PLAN_TAGS :: 256 // tags of one event examined by plan_operation
 
 // -- Kind routing (unchanged) -----------------------------------------
 
@@ -133,6 +146,8 @@ intern :: proc(ev: ^Event, wire_json: string) -> ^Stored {
 			}
 		}
 	}
+	s.anon = anonymous_writer(ev)
+	if s.anon do g_anon_bytes += len(s.json)
 
 	s.idx = len(g_order)
 	append(&g_order, s)
@@ -150,6 +165,7 @@ evict :: proc(s: ^Stored) {
 	pop(&g_order)
 	delete_key(&g_events, s.id)
 
+	if s.anon do g_anon_bytes -= len(s.json)
 	delete(s.id)
 	delete(s.pubkey)
 	for t in s.tags {
@@ -177,9 +193,12 @@ store_open :: proc(path: string) {
 			fmt.eprintfln("[relay] FATAL: corrupt log at offset %d; original file untouched", good)
 			os.exit(1)
 		}
-		if status == .Incomplete && !replace_log(data[:good], false) {
-			fmt.eprintln("[relay] FATAL: cannot durably recover incomplete log tail")
-			os.exit(1)
+		if status == .Incomplete {
+			fmt.printfln("[relay] store: truncating %d torn tail byte(s) at offset %d", len(data)-good, good)
+			if !replace_log(data[:good], false) {
+				fmt.eprintln("[relay] FATAL: cannot durably recover incomplete log tail")
+				os.exit(1)
+			}
 		}
 	} else if rerr != os.Error(os.General_Error.Not_Exist) {
 		fmt.eprintln("[relay] FATAL: cannot read log:", rerr)
@@ -221,13 +240,11 @@ replay :: proc(data: []u8) -> (good: int, status: Record_Status) {
 	for good < len(data) {
 		type, payload, size, record_status := decode_record(data[good:])
 		if record_status == .Incomplete {
-			// A damaged length must not cause a valid suffix to be discarded.
-			// Any complete CRC-valid frame beyond the failure is ambiguous:
-			// preserve the whole file and require operator recovery instead.
-			for i := good+1; i+9 <= len(data); i += 1 {
-				_, _, _, suffix_status := decode_record(data[i:])
-				if suffix_status == .Complete do return good, .Corrupt
-			}
+			// A torn tail is ALWAYS truncated, no rescan: bytes after an
+			// interrupted append are untrustworthy, even when some suffix of
+			// them happens to decode as a complete CRC-valid frame. Only
+			// mid-log damage (bad CRC on a complete-sized record) is .Corrupt
+			// and preserved for operator recovery.
 			return good, .Incomplete
 		}
 		if record_status == .Corrupt do return good, .Corrupt
@@ -329,16 +346,18 @@ deletion_tag_matches :: proc(name, value, author: string, cutoff: i64, id, pubke
 plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: string, rejected: bool) {
 	if ev.id in g_events do return nil, "duplicate: already have this event", false
 	if ev.id in g_deleted do return nil, "blocked: event was deleted", true
+	// Hoisted out of every inner loop below: d_tag(ev) is a per-event scan.
+	ev_d := d_tag(ev)
 	for deletion in g_order {
 		if deletion.kind != 5 || deletion.pubkey != ev.pubkey do continue
 		for tag in deletion.tags {
-			if deletion_tag_matches(tag[0], tag[1], deletion.pubkey, deletion.created_at, ev.id, ev.pubkey, ev.kind, d_tag(ev), ev.created_at) {
+			if deletion_tag_matches(tag[0], tag[1], deletion.pubkey, deletion.created_at, ev.id, ev.pubkey, ev.kind, ev_d, ev.created_at) {
 				return nil, "blocked: event was deleted", true
 			}
 		}
 	}
 	victims = make([dynamic]^Stored, context.temp_allocator)
-	d := is_addressable(ev.kind) ? d_tag(ev) : ""
+	d := is_addressable(ev.kind) ? ev_d : ""
 	// Visit each stored event exactly once. Repeated e/a tags can never
 	// produce duplicate pointers (and therefore cannot double-free victims).
 	for s in g_order {
@@ -350,7 +369,11 @@ plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: strin
 			victim = true
 		}
 		if ev.kind == 5 {
-			for tag in ev.tags {
+			// Only the first MAX_PLAN_TAGS tags of a kind-5 are honoured and a
+			// single deletion retires at most MAX_LIMIT events; either excess
+			// is absurd at this scale and silently ignored.
+			for tag, i in ev.tags {
+				if i >= MAX_PLAN_TAGS || len(victims) >= MAX_LIMIT do break
 				if len(tag) >= 2 && deletion_tag_matches(tag[0], tag[1], ev.pubkey, ev.created_at, s.id, s.pubkey, s.kind, s.d, s.created_at) {
 					victim = true
 					break
@@ -367,6 +390,30 @@ apply_operation :: proc(ev: ^Event, wire: string, victims: []^Stored) {
 	_ = intern(ev, wire)
 }
 
+// Anonymous gift wraps are bounded per recipient: once a resident holds
+// ANON_MAX_GIFTS_PER_TARGET kind-1059 envelopes, further stranger gifts to
+// them are rejected (nothing is evicted). Write-path only, never consulted
+// during replay: anonymity depends on the dynamic allowlist, which is empty
+// at boot, so a replay-time check could drop events the writer accepted.
+gift_inbox_full :: proc(ev: ^Event) -> bool {
+	if ev.kind != 1059 || !anonymous_writer(ev) do return false
+	seen := make(map[string]bool, context.temp_allocator)
+	for tag, i in ev.tags {
+		if i >= MAX_PLAN_TAGS do break
+		if len(tag) < 2 || tag[0] != "p" || tag[1] in seen || !write_allowed(tag[1]) do continue
+		seen[tag[1]] = true
+		count := 0
+		for s in g_order {
+			if s.kind != 1059 do continue
+			for t in s.tags {
+				if t[0] == "p" && t[1] == tag[1] { count += 1; break }
+			}
+		}
+		if count >= ANON_MAX_GIFTS_PER_TARGET do return true
+	}
+	return false
+}
+
 store_event :: proc(ev: ^Event) -> (ok: bool, message: string) {
 	sync.lock(&g_mu)
 	defer sync.unlock(&g_mu)
@@ -375,8 +422,16 @@ store_event :: proc(ev: ^Event) -> (ok: bool, message: string) {
 	if !event_write_allowed(ev) do return false, "restricted: pubkey not on the allowlist"
 	wire := event_json(ev)
 	if len(wire) > MAX_RECORD do return false, "invalid: serialized event too large"
+	if gift_inbox_full(ev) do return false, "blocked: recipient gift inbox is full"
 	victims, msg, rejected := plan_operation(ev)
 	if msg != "" do return !rejected, msg
+	if anonymous_writer(ev) {
+		freed := 0
+		for s in victims do if s.anon do freed += len(s.json)
+		if g_anon_bytes - freed + len(wire) > ANON_MAX_TOTAL_BYTES {
+			return false, "blocked: anonymous storage quota exceeded"
+		}
+	}
 	if !append_operation(wire) do return false, "error: storage failure"
 	apply_operation(ev, wire, victims[:])
 	if ev.kind == 5 || ev.kind == ALLOWLIST_KIND do refresh_dynamic_allowlist_locked()

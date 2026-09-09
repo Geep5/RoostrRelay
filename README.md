@@ -28,9 +28,14 @@ Fly proxy (TLS)  →  plaintext :7777
   deletion honored for the author's own events.
 - Caps: 1 MiB inbound message/serialized event, 900 KiB content, 32 subscriptions
   per connection, 10 filters/REQ, limit ≤ 1000, and 8 MiB total query response
-  budget. Filter arrays and retained filter bytes are bounded. Budget exhaustion
+  budget. Filter arrays and retained filter bytes are bounded. Inbound JSON
+  nesting is depth-capped before parsing, and each connection may publish at
+  most 30 EVENTs per second (excess gets `OK false "rate-limited"`). Budget exhaustion
   returns `CLOSED`, not a false `EOSE`. Outbound queues include in-flight bytes
   and are capped at 10 MiB; slow consumers have a total write deadline.
+  At most 512 connections are served; excess sockets close on accept. Every
+  socket has a 125 s receive deadline that only silent peers can trip - the
+  ping loop pongs keep any healthy subscriber well clear of it.
 - Control frames require FIN and ≤125 bytes, and per-frame scratch memory is
   reclaimed even for control-only traffic. Fragment counts and bytes are bounded.
 
@@ -40,8 +45,11 @@ Back up the log before upgrading. The reader accepts legacy `E`/`T` records;
 new `A` records atomically describe an event and its derived deletion/replacement
 effects. Their CRC covers header and payload. Writes must complete and sync
 before memory changes; an I/O failure latches the writer closed until recovery.
-Incomplete EOF tails can be repaired. Complete corruption preserves the original
-file and fails startup instead of silently discarding the suffix.
+An incomplete EOF tail is ALWAYS truncated at boot (and the truncation is
+logged): bytes past a torn append are untrustworthy, even when some suffix of
+them happens to decode as a complete CRC-valid frame. Mid-log damage - a bad
+CRC on a complete-sized record - still preserves the original file untouched
+and fails startup for operator recovery.
 
 Compaction preserves deleted IDs and deletion requests so removed events cannot
 be restored by republishing them. It checks file and directory sync/rename errors.
@@ -51,9 +59,12 @@ It is boot-triggered after sufficient tombstones; canonical history has no TTL.
 would treat new records as a torn tail. Restore a matching pre-upgrade backup or
 use an explicit conversion when rolling back.
 
-These bounds are not a public subscription/quota system. Anonymous profile and
-join-envelope admission still needs product-specific rate/storage quotas before
-unrestricted public registration.
+Anonymous (non-allowlisted) writers are fenced in: a single event is capped at
+64 KiB (residents keep the 1 MiB record cap), their aggregate retained size is
+capped at 32 MiB of wire bytes (further writes are rejected until their old
+events are deleted or superseded), and each resident recipient retains at most
+64 kind-1059 gift envelopes - further stranger gifts are rejected outright,
+none are evicted. These are doorknob quotas, not a public subscription system.
 
 ## Config (env)
 

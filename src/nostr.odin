@@ -331,8 +331,30 @@ send_event :: proc(c: ^Conn, sub_id: string, ev_json: string) -> bool {
 MAX_CONTENT :: 900 * 1024 // leave frame headroom under MAX_MESSAGE
 CREATED_AT_SLOP_FUTURE :: 15 * 60 // 15 min clock skew allowance
 MAX_TAGS :: 4096
+// Anonymous (non-allowlisted) writers get a much smaller per-event budget
+// than residents; the 1 MiB record cap still bounds allowlisted writes.
+ANON_MAX_EVENT_BYTES :: 64 << 10
+// Cheap per-connection EVENT throttle: one counter and one timestamp per
+// Conn, owned by the reader thread (no locks). Verification is the
+// expensive step, so unverifiable floods must stop before it.
+MAX_EVENTS_PER_WINDOW :: 30
+
+// Sliding 1-second window. Returns false once the window's allowance is
+// spent; any new second resets it. Factored off Conn so tests need no socket.
+event_rate_ok :: proc(window_start: ^i64, count: ^int, now: i64) -> bool {
+	if now != window_start^ {
+		window_start^ = now
+		count^ = 0
+	}
+	count^ += 1
+	return count^ <= MAX_EVENTS_PER_WINDOW
+}
 
 handle_message :: proc(c: ^Conn, raw: string) {
+	if !json_depth_ok(transmute([]u8)raw) {
+		send_notice(c, "invalid: JSON nesting too deep")
+		return
+	}
 	parsed, perr := json.parse(transmute([]byte)raw, allocator = context.temp_allocator)
 	if perr != nil {
 		send_notice(c, "invalid: not JSON")
@@ -387,6 +409,12 @@ event_write_allowed :: proc(ev: ^Event) -> bool {
 	return false
 }
 
+// Admitted through the stranger doors (own kind-0 or addressed kind-1059)
+// rather than the allowlist. Open relays (no allowlist) have no strangers.
+anonymous_writer :: proc(ev: ^Event) -> bool {
+	return len(g_allowed) > 0 && !write_allowed(ev.pubkey)
+}
+
 handle_event :: proc(c: ^Conn, v: json.Value) {
 	ev, perr := parse_event(v)
 	if perr != "" {
@@ -394,6 +422,10 @@ handle_event :: proc(c: ^Conn, v: json.Value) {
 		// for a parse failure, OK for anything with a plausible id.
 		if ev.id != "" do send_ok(c, ev.id, false, perr)
 		else do send_notice(c, perr)
+		return
+	}
+	if !event_rate_ok(&c.ev_window, &c.ev_count, unix_now()) {
+		send_ok(c, ev.id, false, "rate-limited: too many events")
 		return
 	}
 
@@ -420,8 +452,13 @@ handle_event :: proc(c: ^Conn, v: json.Value) {
 		send_ok(c, ev.id, false, "invalid: created_at too far in the future")
 		return
 	}
-	if len(event_json(&ev)) > MAX_RECORD {
+	wire_len := len(event_json(&ev))
+	if wire_len > MAX_RECORD {
 		send_ok(c, ev.id, false, "invalid: serialized event too large")
+		return
+	}
+	if wire_len > ANON_MAX_EVENT_BYTES && anonymous_writer(&ev) {
+		send_ok(c, ev.id, false, "invalid: event too large for unlisted writer")
 		return
 	}
 

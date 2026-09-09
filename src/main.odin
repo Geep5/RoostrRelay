@@ -19,6 +19,7 @@ import "core:net"
 import "core:os"
 import "core:mem"
 import "core:thread"
+import "core:sync"
 import "core:strings"
 import "core:strconv"
 import "core:time"
@@ -62,6 +63,13 @@ main :: proc() {
 	for {
 		client, _, aerr := net.accept_tcp(sock)
 		if aerr != nil do continue
+		sync.lock(&g_conns_mu)
+		full := len(g_conns) >= MAX_CONNECTIONS
+		sync.unlock(&g_conns_mu)
+		if full {
+			net.close(client) // refuse overflow without spending a thread
+			continue
+		}
 		// self_cleanup: thread detaches and frees its own ^Thread on exit.
 		thread.run_with_poly_data(client, handle_connection)
 	}
@@ -82,6 +90,10 @@ handle_connection :: proc(sock: net.TCP_Socket) {
 	defer mem.dynamic_arena_destroy(&arena)
 
 	net.set_option(sock, .Send_Timeout, WS_SEND_TIMEOUT)
+	// Bounds the pre-upgrade head read (slowloris) and silent dead peers; a
+	// pong-answering client can never trip it (see WS_RECV_TIMEOUT). A recv
+	// timeout surfaces from recv like EOF: read_head/ws_read_step close cleanly.
+	net.set_option(sock, .Receive_Timeout, WS_RECV_TIMEOUT)
 
 	req, ok := read_head(sock)
 	if !ok {

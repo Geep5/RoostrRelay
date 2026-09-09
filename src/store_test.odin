@@ -23,6 +23,7 @@ when ODIN_TEST {
 		g_events = make(map[string]^Stored)
 		g_deleted = make(map[string]bool)
 		g_tombs = 0
+		g_anon_bytes = 0
 		g_append_failed = false
 	}
 
@@ -206,11 +207,11 @@ when ODIN_TEST {
 		good, status := replay(log)
 		testing.expect(t, good == 0 && status == .Corrupt && len(g_order) == 0)
 		copy(log, frame)
-		// A plausible but damaged length swallowing the suffix is not a torn tail.
+		// A damaged length is indistinguishable from a torn append: truncate.
 		n := u32(len(log)+100)
 		for i in 0..<4 do log[i+1] = u8(n >> uint(8*i))
 		good, status = replay(log)
-		testing.expect(t, good == 0 && status == .Corrupt)
+		testing.expect(t, good == 0 && status == .Incomplete && len(g_order) == 0)
 		bad_json := store_test_frame('E', "not JSON")
 		_, status = replay(bad_json)
 		testing.expect_value(t, status, Record_Status.Corrupt)
@@ -408,5 +409,145 @@ when ODIN_TEST {
 		testing.expect(t, err == nil)
 		_, ok = parse_filter(v)
 		testing.expect(t, !ok)
+	}
+
+	@(test)
+	store_torn_tail_always_truncates :: proc(t: ^testing.T) {
+		sync.lock(&store_test_mu)
+		defer sync.unlock(&store_test_mu)
+		defer store_test_cleanup()
+		ev1 := store_test_event(1)
+		ev2 := store_test_event(2, 1, 20)
+		frame1 := store_test_frame('A', event_json(&ev1))
+		frame2 := store_test_frame('A', event_json(&ev2))
+
+		// Plain torn tail: heals by truncating the partial record.
+		store_test_reset()
+		log := make([]u8, len(frame1)+7, context.temp_allocator)
+		copy(log, frame1)
+		copy(log[len(frame1):], frame2[:7])
+		good, status := replay(log)
+		testing.expect(t, status == .Incomplete && good == len(frame1))
+		testing.expect(t, ev1.id in g_events && !(ev2.id in g_events))
+
+		// A valid frame PLANTED after torn bytes is discarded with the tail:
+		// bytes past an interrupted append are untrustworthy. Boot must heal,
+		// never FATAL. The torn header claims a length past end-of-file.
+		store_test_reset()
+		torn: [5]u8
+		torn[0] = 'A'
+		n := u32(64 << 10)
+		for i in 0..<4 do torn[i+1] = u8(n >> uint(8*i))
+		log2 := make([]u8, len(frame1)+len(torn)+len(frame2), context.temp_allocator)
+		copy(log2, frame1)
+		copy(log2[len(frame1):], torn[:])
+		copy(log2[len(frame1)+len(torn):], frame2)
+		good, status = replay(log2)
+		testing.expect(t, status == .Incomplete && good == len(frame1))
+		testing.expect(t, ev1.id in g_events && !(ev2.id in g_events))
+
+		// The healed file replays clean and keeps only the trusted prefix.
+		fd, err := os.create_temp_file("", "relay-heal-*")
+		if !testing.expect(t, err == nil) do return
+		path := strings.clone(os.name(fd))
+		defer delete(path)
+		defer os.remove(path)
+		os.close(fd)
+		g_log_path = path
+		defer g_log_path = ""
+		testing.expect(t, replace_log(log2[:good], false))
+		store_test_reset()
+		data, rerr := os.read_entire_file_from_path(path, context.allocator)
+		if !testing.expect(t, rerr == nil) do return
+		defer delete(data)
+		good, status = replay(data)
+		testing.expect(t, status == .Complete && good == len(frame1))
+		testing.expect(t, ev1.id in g_events && !(ev2.id in g_events))
+
+		// Mid-log CRC damage on a complete-sized record still refuses to boot.
+		store_test_reset()
+		log3 := make([]u8, len(frame1)+len(frame2), context.temp_allocator)
+		copy(log3, frame1)
+		copy(log3[len(frame1):], frame2)
+		log3[len(frame1)+5] ~= 1
+		good, status = replay(log3)
+		testing.expect(t, status == .Corrupt && good == len(frame1))
+	}
+
+	@(test)
+	store_anonymous_quotas :: proc(t: ^testing.T) {
+		sync.lock(&store_test_mu)
+		defer sync.unlock(&store_test_mu)
+		store_test_reset()
+		defer store_test_cleanup()
+		old_allowed := g_allowed
+		g_allowed = make(map[string]bool)
+		defer { delete(g_allowed); g_allowed = old_allowed }
+		resident := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		stranger := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		g_allowed[resident] = true
+		fd, err := os.create_temp_file("", "relay-quota-*")
+		if !testing.expect(t, err == nil) do return
+		path := strings.clone(os.name(fd))
+		defer delete(path)
+		defer os.remove(path)
+		g_fd = fd
+		defer { os.close(fd); g_fd = nil }
+
+		// Gift cap: ANON_MAX_GIFTS_PER_TARGET per resident recipient, then
+		// further stranger gifts are rejected (nothing is evicted).
+		for i in 0..<ANON_MAX_GIFTS_PER_TARGET {
+			gift := store_test_event(i+1, 1059)
+			gift.pubkey = stranger
+			gift.tags = [][]string{{"p", resident}}
+			gift.tags_json = canon_tags(gift.tags)
+			ok, _ := store_event(&gift)
+			testing.expect(t, ok)
+		}
+		testing.expect(t, g_anon_bytes > 0)
+		gift := store_test_event(1000, 1059)
+		gift.pubkey = stranger
+		gift.tags = [][]string{{"p", resident}}
+		gift.tags_json = canon_tags(gift.tags)
+		ok, message := store_event(&gift)
+		testing.expect(t, !ok && strings.contains(message, "gift inbox") && !(gift.id in g_events))
+		// A different resident's inbox is unaffected, and a resident's own
+		// gifts are not capped.
+		other := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		g_allowed[other] = true
+		gift.id = fmt.tprintf("%064x", 1001)
+		gift.tags = [][]string{{"p", other}}
+		gift.tags_json = canon_tags(gift.tags)
+		ok, _ = store_event(&gift)
+		testing.expect(t, ok)
+		gift.id = fmt.tprintf("%064x", 1002)
+		gift.pubkey = resident
+		gift.tags = [][]string{{"p", resident}}
+		gift.tags_json = canon_tags(gift.tags)
+		ok, _ = store_event(&gift)
+		testing.expect(t, ok)
+
+		// Byte cap: strangers cannot retain more than ANON_MAX_TOTAL_BYTES in
+		// aggregate, even rotating fresh keys (kind-0 is 1 per pubkey).
+		content := strings.repeat("x", 1 << 20 - 1024, context.temp_allocator)
+		stored := 0
+		for i in 0..<64 {
+			ev := store_test_event(2000+i, 0)
+			ev.pubkey = fmt.tprintf("%064x", i+0x1000)
+			ev.content = content
+			ok, message = store_event(&ev)
+			if !ok {
+				testing.expect(t, strings.contains(message, "quota") && !(ev.id in g_events))
+				break
+			}
+			stored += 1
+		}
+		testing.expect(t, stored >= 31 && stored < 64 && g_anon_bytes <= ANON_MAX_TOTAL_BYTES)
+		// A stranger updating their OWN kind-0 supersedes the old copy and its
+		// bytes, so a writer at the quota boundary is never locked out.
+		ev := store_test_event(3000, 0, 20)
+		ev.pubkey = fmt.tprintf("%064x", 0x1000)
+		ok, _ = store_event(&ev)
+		testing.expect(t, ok)
 	}
 }

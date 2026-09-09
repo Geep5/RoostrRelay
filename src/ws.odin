@@ -49,13 +49,15 @@ Conn :: struct {
 	sender:    ^thread.Thread,
 	send_mu:   sync.Mutex, // protects queue, stopping, closing and last_pong
 	send_ready: sync.Cond,
-	outbound:  [MAX_OUTBOUND_FRAMES][]byte,
+	outbound:  [][]byte, // ring slots, len == capacity; allocated lazily, doubled to MAX_OUTBOUND_FRAMES
 	out_head:  int,
 	out_count: int,
 	out_bytes: int, // includes the frame currently owned by the sender
 	stopping:  bool,
 	closing:   bool,
 	last_pong: i64, // unix seconds; any valid inbound frame proves liveness
+	ev_window: i64, // unix seconds; current EVENT rate-limit window (reader thread only)
+	ev_count:  int, // EVENTs seen in the current window (reader thread only)
 }
 
 g_conns: [dynamic]^Conn
@@ -66,6 +68,10 @@ MAX_FILTERS_PER_REQ :: 10
 MAX_LIMIT :: 1000
 PING_INTERVAL :: 30 // seconds
 PONG_DEADLINE :: 95 // drop if no pong for this long
+OUTBOUND_INITIAL_CAPACITY :: 64 // first ring allocation, on first queued frame
+// Bound on registered connections; the accept loop closes overflow sockets
+// immediately instead of spending a reader/sender thread pair on them.
+MAX_CONNECTIONS :: 512
 // Accept one complete byte-budgeted historical REQ without depending on
 // sender scheduling, with headroom for control frames and live replies.
 MAX_OUTBOUND_BYTES :: MAX_QUERY_BYTES + 2 * MAX_MESSAGE
@@ -73,6 +79,13 @@ MAX_OUTBOUND_FRAMES :: MAX_FILTERS_PER_REQ * MAX_LIMIT + 64
 MAX_SERVER_MESSAGE :: MAX_RECORD + QUERY_ROW_OVERHEAD // EVENT envelope around a legal stored record
 MAX_MESSAGE_FRAGMENTS :: 1024 // bounds even a stream of empty continuations
 WS_SEND_TIMEOUT :: 10 * time.Second
+// Receive deadline for every accepted socket, pre-upgrade head reads included.
+// A healthy subscriber answers each ping, so its inbound gap never exceeds one
+// ping interval plus transit, and the ping loop itself drops a connection after
+// PONG_DEADLINE silent seconds: this deadline is always the LAST guard a live
+// client could trip. It only reaps pre-upgrade tricklers and dead peers, and a
+// timeout surfaces from recv like EOF - a clean close, never an error or panic.
+WS_RECV_TIMEOUT :: (PONG_DEADLINE + PING_INTERVAL) * time.Second
 
 // -- Frame codec ------------------------------------------------------
 
@@ -175,9 +188,25 @@ ws_queue_pop :: proc(c: ^Conn) -> []byte {
 	assert(c.out_count > 0)
 	frame := c.outbound[c.out_head]
 	c.outbound[c.out_head] = nil
-	c.out_head = (c.out_head + 1) % MAX_OUTBOUND_FRAMES
+	c.out_head = (c.out_head + 1) % len(c.outbound)
 	c.out_count -= 1
 	return frame // byte budget remains charged until the sender frees it
+}
+
+// Requires send_mu. Doubles ring storage, bounded by MAX_OUTBOUND_FRAMES,
+// re-linearizing from the head so queued frames keep their order and the
+// sender thread never observes a half-moved ring.
+ws_queue_grow :: proc(c: ^Conn) -> bool {
+	cap_new := min(MAX_OUTBOUND_FRAMES, max(OUTBOUND_INITIAL_CAPACITY, 2 * len(c.outbound)))
+	grown, err := make([][]byte, cap_new, c.allocator)
+	if err != nil do return false
+	for i in 0 ..< c.out_count {
+		grown[i] = c.outbound[(c.out_head + i) % len(c.outbound)]
+	}
+	delete(c.outbound, c.allocator)
+	c.outbound = grown
+	c.out_head = 0
+	return true
 }
 
 ws_queue_discard :: proc(c: ^Conn) {
@@ -186,6 +215,9 @@ ws_queue_discard :: proc(c: ^Conn) {
 		c.out_bytes -= len(frame)
 		delete(frame, c.allocator)
 	}
+	delete(c.outbound, c.allocator)
+	c.outbound = nil
+	c.out_head = 0
 }
 
 ws_stop_locked :: proc(c: ^Conn) {
@@ -250,7 +282,12 @@ ws_send :: proc(c: ^Conn, op: Opcode, payload: []byte) -> bool {
 	}
 	copy(owned[:n], hdr[:n])
 	copy(owned[n:], payload)
-	c.outbound[(c.out_head + c.out_count) % MAX_OUTBOUND_FRAMES] = owned
+	if c.out_count == len(c.outbound) && !ws_queue_grow(c) {
+		delete(owned, c.allocator)
+		ws_stop_locked(c)
+		return false
+	}
+	c.outbound[(c.out_head + c.out_count) % len(c.outbound)] = owned
 	c.out_count += 1
 	c.out_bytes += size
 	if op == .Close do c.closing = true
