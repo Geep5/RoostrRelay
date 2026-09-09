@@ -1,123 +1,57 @@
 package relay
 
-// SQLite storage behind a narrow seam: store_event / query_filter /
-// delete-by-request. Hand bindings against the stable C API (12 calls).
-// One process-wide write path serialized under g_db_mu; WAL mode keeps
-// this workable. (Single connection, single mutex - at Roostr scale the
-// reader/writer split is premature; the seam makes it a later upgrade,
-// and the same seam is where a libsql/Turso swap would happen.)
+// Pure-Odin storage: an append-only log of framed records plus in-memory
+// indexes rebuilt on boot. No sqlite, no C.
+//
+// Why this shape fits a relay: events are immutable and content-addressed,
+// "updates" are supersedes (replaceable/addressable kinds) and NIP-09
+// deletions - both are tombstones here. The log is truth; memory mirrors
+// it. And the relay itself is a cache in the Roostr architecture (the
+// .pb files on devices are truth; harnesses republish what the relay
+// lacks at startup reconcile), so even catastrophic loss self-heals.
+//
+// Record framing:  [1B type][u32le len][payload][u32le crc32(payload)]
+//   'E'  event, payload = wire JSON (the exact bytes REQ echoes back)
+//   'T'  tombstone, payload = 64-char hex event id
+// A torn tail (crash mid-append) fails the length/CRC check and is
+// truncated on boot - everything before it is intact.
+//
+// Concurrency matches the sqlite version: one process-wide mutex over
+// both the file and the maps. At Roostr scale a reader/writer split is
+// still premature; the seam (store_open/store_event/query_filter) is
+// unchanged, so that upgrade stays a drop-in.
 
-import "core:c"
+import "core:encoding/json"
 import "core:fmt"
+import "core:hash"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 
-foreign import sq "system:sqlite3"
+g_mu: sync.Mutex
+g_fd: ^os.File
+g_log_path: string
 
-SQLITE_OK :: 0
-SQLITE_ROW :: 100
-SQLITE_DONE :: 101
-SQLITE_OPEN_READWRITE :: 0x02
-SQLITE_OPEN_CREATE :: 0x04
-SQLITE_TRANSIENT := rawptr(~uintptr(0))
-
-foreign sq {
-	sqlite3_open_v2 :: proc "c" (filename: cstring, db: ^rawptr, flags: c.int, vfs: cstring) -> c.int ---
-	sqlite3_close :: proc "c" (db: rawptr) -> c.int ---
-	sqlite3_exec :: proc "c" (db: rawptr, sql: cstring, cb: rawptr, arg: rawptr, errmsg: ^cstring) -> c.int ---
-	sqlite3_prepare_v2 :: proc "c" (db: rawptr, sql: cstring, nbyte: c.int, stmt: ^rawptr, tail: ^cstring) -> c.int ---
-	sqlite3_bind_text :: proc "c" (stmt: rawptr, idx: c.int, text: [^]u8, nbyte: c.int, destructor: rawptr) -> c.int ---
-	sqlite3_bind_int64 :: proc "c" (stmt: rawptr, idx: c.int, value: i64) -> c.int ---
-	sqlite3_step :: proc "c" (stmt: rawptr) -> c.int ---
-	sqlite3_column_text :: proc "c" (stmt: rawptr, col: c.int) -> cstring ---
-	sqlite3_column_int64 :: proc "c" (stmt: rawptr, col: c.int) -> i64 ---
-	sqlite3_finalize :: proc "c" (stmt: rawptr) -> c.int ---
-	sqlite3_errmsg :: proc "c" (db: rawptr) -> cstring ---
-	sqlite3_changes :: proc "c" (db: rawptr) -> c.int ---
+Stored :: struct {
+	id:         string,
+	pubkey:     string,
+	created_at: i64,
+	kind:       i64,
+	d:          string, // addressable identity ("" otherwise)
+	tags:       [][2]string, // single-letter tags only (the indexed set)
+	json:       string, // wire JSON, echoed verbatim by REQ
+	idx:        int, // position in g_order (swap-remove bookkeeping)
 }
 
-g_db: rawptr
-g_db_mu: sync.Mutex
+g_events: map[string]^Stored
+g_order: [dynamic]^Stored
+g_tombs: int // tombstoned records currently wasting log bytes
 
-SCHEMA :: `
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous  = NORMAL;
-PRAGMA busy_timeout = 5000;
-PRAGMA foreign_keys = ON;
+MAX_RECORD :: 1 << 19 // 512 KiB - relay caps messages far below this
+COMPACT_MIN_TOMBS :: 1024
 
-CREATE TABLE IF NOT EXISTS events (
-  id          TEXT PRIMARY KEY,
-  pubkey      TEXT NOT NULL,
-  created_at  INTEGER NOT NULL,
-  kind        INTEGER NOT NULL,
-  tags        TEXT NOT NULL,
-  content     TEXT NOT NULL,
-  sig         TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS tags (
-  event_id    TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-  name        TEXT NOT NULL,
-  value       TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_events_kind    ON events(kind, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_events_pubkey  ON events(pubkey, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_tags_lookup    ON tags(name, value, event_id);
-`
-
-store_open :: proc(path: string) {
-	cpath := strings.clone_to_cstring(path)
-	rc := sqlite3_open_v2(cpath, &g_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil)
-	if rc != SQLITE_OK {
-		fmt.eprintln("[relay] sqlite open failed:", path)
-		os.exit(1)
-	}
-	errmsg: cstring
-	if sqlite3_exec(g_db, SCHEMA, nil, nil, &errmsg) != SQLITE_OK {
-		fmt.eprintln("[relay] schema failed:", errmsg)
-		os.exit(1)
-	}
-}
-
-// -- Small statement helpers ------------------------------------------
-
-prep :: proc(sql: string) -> (rawptr, bool) {
-	stmt: rawptr
-	csql := strings.clone_to_cstring(sql, context.temp_allocator)
-	if sqlite3_prepare_v2(g_db, csql, -1, &stmt, nil) != SQLITE_OK {
-		fmt.eprintln("[relay] prepare failed:", sqlite3_errmsg(g_db), "sql:", sql)
-		return nil, false
-	}
-	return stmt, true
-}
-
-g_empty_byte: [1]u8
-
-bind_str :: proc(stmt: rawptr, idx: int, s: string) {
-	// raw_data("") is nil, and sqlite3_bind_text(NULL) binds SQL NULL
-	// no matter what nbyte says - route empty strings through a real
-	// pointer so they stay TEXT ''.
-	data := raw_data(s)
-	if data == nil do data = &g_empty_byte[0]
-	sqlite3_bind_text(stmt, c.int(idx), data, c.int(len(s)), SQLITE_TRANSIENT)
-}
-
-exec_simple :: proc(sql: string) -> bool {
-	errmsg: cstring
-	csql := strings.clone_to_cstring(sql, context.temp_allocator)
-	return sqlite3_exec(g_db, csql, nil, nil, &errmsg) == SQLITE_OK
-}
-
-// -- store_event ------------------------------------------------------
-//
-// Kind routing (ephemeral is handled before we get here):
-//   0, 3, 10000-19999          replaceable: newest per (pubkey, kind)
-//   30000-39999                addressable: newest per (pubkey, kind, d)
-//   5                          NIP-09 deletion request
-//   everything else            regular insert
+// -- Kind routing (unchanged) -----------------------------------------
 
 is_replaceable :: proc(kind: i64) -> bool {
 	return kind == 0 || kind == 3 || (kind >= 10000 && kind < 20000)
@@ -134,128 +68,281 @@ d_tag :: proc(ev: ^Event) -> string {
 	return ""
 }
 
-store_event :: proc(ev: ^Event) -> (ok: bool, message: string) {
-	sync.lock(&g_db_mu)
-	defer sync.unlock(&g_db_mu)
+// -- Log primitives ----------------------------------------------------
 
-	// Duplicate check up front - cheapest path, and the OK message
-	// convention lets clients distinguish it.
-	{
-		stmt, pok := prep("SELECT 1 FROM events WHERE id = ?")
-		if !pok do return false, "error: storage failure"
-		bind_str(stmt, 1, ev.id)
-		dup := sqlite3_step(stmt) == SQLITE_ROW
-		sqlite3_finalize(stmt)
-		if dup do return true, "duplicate: already have this event"
+@(private = "file")
+write_record :: proc(type: u8, payload: string) -> bool {
+	head: [5]u8
+	head[0] = type
+	n := u32(len(payload))
+	head[1] = u8(n)
+	head[2] = u8(n >> 8)
+	head[3] = u8(n >> 16)
+	head[4] = u8(n >> 24)
+	crc := hash.crc32(transmute([]u8)payload)
+	tail: [4]u8
+	tail[0] = u8(crc)
+	tail[1] = u8(crc >> 8)
+	tail[2] = u8(crc >> 16)
+	tail[3] = u8(crc >> 24)
+	if _, err := os.write(g_fd, head[:]); err != nil do return false
+	if _, err := os.write(g_fd, transmute([]u8)payload); err != nil do return false
+	if _, err := os.write(g_fd, tail[:]); err != nil do return false
+	return true
+}
+
+@(private = "file")
+sync_log :: proc() -> bool {
+	return os.sync(g_fd) == nil
+}
+
+// -- In-memory index ---------------------------------------------------
+
+@(private = "file")
+intern :: proc(ev: ^Event, wire_json: string) -> ^Stored {
+	s := new(Stored)
+	s.id = strings.clone(ev.id)
+	s.pubkey = strings.clone(ev.pubkey)
+	s.created_at = ev.created_at
+	s.kind = ev.kind
+	s.json = strings.clone(wire_json)
+
+	count := 0
+	for tag in ev.tags {
+		if len(tag) >= 2 && len(tag[0]) == 1 {
+			ch := tag[0][0]
+			if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' do count += 1
+		}
+	}
+	s.tags = make([][2]string, count)
+	i := 0
+	for tag in ev.tags {
+		if len(tag) >= 2 && len(tag[0]) == 1 {
+			ch := tag[0][0]
+			if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' {
+				s.tags[i] = {strings.clone(tag[0]), strings.clone(tag[1])}
+				if tag[0] == "d" && s.d == "" do s.d = s.tags[i][1]
+				i += 1
+			}
+		}
+	}
+
+	s.idx = len(g_order)
+	append(&g_order, s)
+	g_events[s.id] = s
+	return s
+}
+
+@(private = "file")
+evict :: proc(s: ^Stored) {
+	// Swap-remove from g_order, keeping idx fields honest.
+	last := g_order[len(g_order) - 1]
+	g_order[s.idx] = last
+	last.idx = s.idx
+	pop(&g_order)
+	delete_key(&g_events, s.id)
+
+	delete(s.id)
+	delete(s.pubkey)
+	for t in s.tags {
+		delete(t[0])
+		delete(t[1])
+	}
+	delete(s.tags)
+	delete(s.json)
+	free(s)
+	g_tombs += 1
+}
+
+// -- Boot: replay, heal, compact ---------------------------------------
+
+store_open :: proc(path: string) {
+	g_log_path = strings.clone(path)
+	g_events = make(map[string]^Stored)
+
+	if data, rerr := os.read_entire_file_from_path(path, context.allocator); rerr == nil {
+		defer delete(data)
+		// A leftover sqlite file is not ours to parse - set it aside and
+		// start fresh; harness startup reconcile repopulates the cache.
+		if len(data) >= 16 && string(data[:15]) == "SQLite format 3" {
+			bak := fmt.tprintf("%s.sqlite.bak", path)
+			_ = os.rename(path, bak)
+			fmt.printfln("[relay] found sqlite store; moved to %s and starting a fresh log", bak)
+		} else {
+			replay(data)
+		}
+	}
+
+	if g_tombs >= COMPACT_MIN_TOMBS {
+		compact()
+	} else {
+		// Reopen for appends (replay may have truncated a torn tail).
+		reopen_for_append()
+	}
+	fmt.printfln("[relay] store: %d event(s), %d tombstone(s) in log", len(g_order), g_tombs)
+}
+
+@(private = "file")
+replay :: proc(data: []u8) {
+	off := 0
+	good := 0 // byte offset after the last valid record
+	for off + 9 <= len(data) {
+		type := data[off]
+		n := int(data[off + 1]) | int(data[off + 2]) << 8 | int(data[off + 3]) << 16 | int(data[off + 4]) << 24
+		if (type != 'E' && type != 'T') || n <= 0 || n > MAX_RECORD || off + 5 + n + 4 > len(data) do break
+		payload := data[off + 5:off + 5 + n]
+		c := data[off + 5 + n:off + 5 + n + 4]
+		want := u32(c[0]) | u32(c[1]) << 8 | u32(c[2]) << 16 | u32(c[3]) << 24
+		if hash.crc32(payload) != want do break
+
+		switch type {
+		case 'E':
+			apply_event_record(string(payload))
+		case 'T':
+			if s, have := g_events[string(payload)]; have do evict(s)
+		}
+		off += 5 + n + 4
+		good = off
+	}
+	if good < len(data) {
+		fmt.printfln("[relay] log: truncating %d torn byte(s) at offset %d", len(data) - good, good)
+		truncate_log(good, data[:good])
+	}
+}
+
+@(private = "file")
+apply_event_record :: proc(wire: string) {
+	v, jerr := json.parse(transmute([]u8)wire, .JSON, false, context.temp_allocator)
+	if jerr != nil do return
+	ev, perr := parse_event(v)
+	if perr != "" do return
+	if _, have := g_events[ev.id]; have do return
+	_ = intern(&ev, wire)
+}
+
+@(private = "file")
+truncate_log :: proc(size: int, good: []u8) {
+	// os.truncate is not portable across Odin targets; rewrite is - and a
+	// torn tail is a rare crash artifact, not a hot path.
+	tmp := fmt.tprintf("%s.tmp", g_log_path)
+	if os.write_entire_file(tmp, good) != nil {
+		fmt.eprintln("[relay] log: could not rewrite torn tail; keeping as-is")
+		return
+	}
+	if os.rename(tmp, g_log_path) != nil do fmt.eprintln("[relay] log: rename failed after tail rewrite")
+}
+
+@(private = "file")
+reopen_for_append :: proc() {
+	fd, err := os.open(g_log_path, {.Write, .Create, .Append}, os.Permissions_Default_File)
+	if err != nil {
+		fmt.eprintln("[relay] FATAL: cannot open log for append:", err)
+		os.exit(1)
+	}
+	g_fd = fd
+}
+
+/** Rewrite the log with only live events; tombstones and their victims
+ *  vanish. Boot-only, before the socket opens - no concurrency. */
+@(private = "file")
+compact :: proc() {
+	tmp := fmt.tprintf("%s.tmp", g_log_path)
+	fd, err := os.open(tmp, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
+	if err != nil {
+		fmt.eprintln("[relay] compact: cannot open tmp, keeping log as-is:", err)
+		reopen_for_append()
+		return
+	}
+	g_fd = fd
+	ok := true
+	for s in g_order {
+		if !write_record('E', s.json) {
+			ok = false
+			break
+		}
+	}
+	if !ok || os.sync(g_fd) != nil {
+		fmt.eprintln("[relay] compact failed; keeping original log")
+		os.close(g_fd)
+		_ = os.remove(tmp)
+		reopen_for_append()
+		return
+	}
+	os.close(g_fd)
+	if os.rename(tmp, g_log_path) != nil do fmt.eprintln("[relay] compact: rename failed; log may be stale")
+	fmt.printfln("[relay] compacted: %d live event(s), %d tombstone(s) dropped", len(g_order), g_tombs)
+	g_tombs = 0
+	reopen_for_append()
+}
+
+// -- store_event -------------------------------------------------------
+//
+// Log first, memory second: every mutation appends its records and
+// fsyncs before the maps change, so memory never claims what the disk
+// could lose.
+
+store_event :: proc(ev: ^Event) -> (ok: bool, message: string) {
+	sync.lock(&g_mu)
+	defer sync.unlock(&g_mu)
+
+	if _, have := g_events[ev.id]; have {
+		return true, "duplicate: already have this event"
 	}
 
 	// Replaceable/addressable: reject if we hold a newer (or same-age,
-	// lower-id) version; otherwise delete the older one inside the tx.
-	supersede_id := ""
+	// lower-id) version; otherwise the older one is superseded.
+	supersede: ^Stored
 	if is_replaceable(ev.kind) || is_addressable(ev.kind) {
 		d := is_addressable(ev.kind) ? d_tag(ev) : ""
-		sql := `SELECT id, created_at FROM events WHERE pubkey = ?1 AND kind = ?2`
-		if is_addressable(ev.kind) {
-			sql = `SELECT e.id, e.created_at FROM events e
-			 WHERE e.pubkey = ?1 AND e.kind = ?2
-			   AND EXISTS (SELECT 1 FROM tags t WHERE t.event_id = e.id AND t.name = 'd' AND t.value = ?3)`
-		}
-		stmt, pok := prep(sql)
-		if !pok do return false, "error: storage failure"
-		bind_str(stmt, 1, ev.pubkey)
-		sqlite3_bind_int64(stmt, 2, ev.kind)
-		if is_addressable(ev.kind) do bind_str(stmt, 3, d)
-		for sqlite3_step(stmt) == SQLITE_ROW {
-			old_id := strings.clone_from_cstring(sqlite3_column_text(stmt, 0), context.temp_allocator)
-			old_at := sqlite3_column_int64(stmt, 1)
-			if old_at > ev.created_at || (old_at == ev.created_at && old_id < ev.id) {
-				sqlite3_finalize(stmt)
+		for s in g_order {
+			if s.pubkey != ev.pubkey || s.kind != ev.kind do continue
+			if is_addressable(ev.kind) && s.d != d do continue
+			if s.created_at > ev.created_at || (s.created_at == ev.created_at && s.id < ev.id) {
 				return true, "duplicate: have a newer version"
 			}
-			supersede_id = old_id
-		}
-		sqlite3_finalize(stmt)
-	}
-
-	if !exec_simple("BEGIN IMMEDIATE") do return false, "error: storage busy"
-	committed := false
-	defer if !committed do exec_simple("ROLLBACK")
-
-	if supersede_id != "" {
-		stmt, pok := prep("DELETE FROM events WHERE id = ?")
-		if !pok do return false, "error: storage failure"
-		bind_str(stmt, 1, supersede_id)
-		sqlite3_step(stmt)
-		sqlite3_finalize(stmt)
-	}
-
-	{
-		stmt, pok := prep("INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES (?,?,?,?,?,?,?)")
-		if !pok do return false, "error: storage failure"
-		bind_str(stmt, 1, ev.id)
-		bind_str(stmt, 2, ev.pubkey)
-		sqlite3_bind_int64(stmt, 3, ev.created_at)
-		sqlite3_bind_int64(stmt, 4, ev.kind)
-		bind_str(stmt, 5, ev.tags_json)
-		bind_str(stmt, 6, ev.content)
-		bind_str(stmt, 7, ev.sig)
-		rc := sqlite3_step(stmt)
-		sqlite3_finalize(stmt)
-		if rc != SQLITE_DONE {
-			fmt.eprintln("[relay] insert failed:", sqlite3_errmsg(g_db))
-			return false, "error: insert failed"
+			supersede = s
 		}
 	}
 
-	// Single-letter tags into the index table.
-	for tag in ev.tags {
-		if len(tag) < 2 || len(tag[0]) != 1 do continue
-		ch := tag[0][0]
-		if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z') do continue
-		stmt, pok := prep("INSERT INTO tags (event_id, name, value) VALUES (?,?,?)")
-		if !pok do return false, "error: storage failure"
-		bind_str(stmt, 1, ev.id)
-		bind_str(stmt, 2, tag[0])
-		bind_str(stmt, 3, tag[1])
-		sqlite3_step(stmt)
-		sqlite3_finalize(stmt)
-	}
-
-	// NIP-09: deletion request. Only the author's own events die.
+	// NIP-09: collect victims first; the deletion event itself stores too.
+	victims := make([dynamic]^Stored, context.temp_allocator)
 	if ev.kind == 5 {
 		for tag in ev.tags {
 			if len(tag) < 2 do continue
 			if tag[0] == "e" {
-				stmt, pok := prep("DELETE FROM events WHERE id = ? AND pubkey = ? AND kind != 5")
-				if !pok do continue
-				bind_str(stmt, 1, tag[1])
-				bind_str(stmt, 2, ev.pubkey)
-				sqlite3_step(stmt)
-				sqlite3_finalize(stmt)
+				if s, have := g_events[tag[1]]; have && s.pubkey == ev.pubkey && s.kind != 5 {
+					append(&victims, s)
+				}
 			} else if tag[0] == "a" {
-				// kind:pubkey:d - addressable delete, same author only.
 				parts := strings.split(tag[1], ":", context.temp_allocator)
 				if len(parts) != 3 || parts[1] != ev.pubkey do continue
-				stmt, pok := prep(
-					`DELETE FROM events WHERE pubkey = ?1 AND kind = ?2 AND created_at <= ?3
-					   AND EXISTS (SELECT 1 FROM tags t WHERE t.event_id = events.id AND t.name = 'd' AND t.value = ?4)`)
-				if !pok do continue
-				bind_str(stmt, 1, ev.pubkey)
-				bind_str(stmt, 2, parts[0]) // sqlite coerces numeric text
-				sqlite3_bind_int64(stmt, 3, ev.created_at)
-				bind_str(stmt, 4, parts[2])
-				sqlite3_step(stmt)
-				sqlite3_finalize(stmt)
+				for s in g_order {
+					if s.pubkey != ev.pubkey do continue
+					if fmt.tprintf("%d", s.kind) != parts[0] do continue
+					if s.d != parts[2] || s.created_at > ev.created_at do continue
+					append(&victims, s)
+				}
 			}
 		}
 	}
 
-	if !exec_simple("COMMIT") do return false, "error: commit failed"
-	committed = true
+	wire := event_json(ev)
+	if supersede != nil && !write_record('T', supersede.id) {
+		return false, "error: storage failure"
+	}
+	for s in victims {
+		if !write_record('T', s.id) do return false, "error: storage failure"
+	}
+	if !write_record('E', wire) do return false, "error: storage failure"
+	if !sync_log() do return false, "error: storage failure"
+
+	if supersede != nil do evict(supersede)
+	for s in victims do evict(s)
+	_ = intern(ev, wire)
 	return true, ""
 }
 
-// -- query_filter -----------------------------------------------------
+// -- query_filter ------------------------------------------------------
 
 Stored_Event :: struct {
 	id:   string,
@@ -264,99 +351,57 @@ Stored_Event :: struct {
 
 DEFAULT_LIMIT :: 500
 
-// Builds one parameterized SELECT per filter. Values are always bound,
-// never spliced. Results newest-first, temp-allocated.
-query_filter :: proc(f: ^Filter) -> []Stored_Event {
-	sb := strings.builder_make(context.temp_allocator)
-	strings.write_string(&sb, "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE 1=1")
-
-	str_args := make([dynamic]string, context.temp_allocator)
-	int_args := make([dynamic]i64, context.temp_allocator)
-	arg_order := make([dynamic]u8, context.temp_allocator) // 's' or 'i'
-
-	in_list :: proc(sb: ^strings.Builder, col: string, n: int) {
-		strings.write_string(sb, " AND ")
-		strings.write_string(sb, col)
-		strings.write_string(sb, " IN (")
-		for i in 0 ..< n {
-			if i > 0 do strings.write_byte(sb, ',')
-			strings.write_byte(sb, '?')
-		}
-		strings.write_byte(sb, ')')
-	}
-
-	if len(f.ids) > 0 {
-		in_list(&sb, "id", len(f.ids))
-		for v in f.ids { append(&str_args, v); append(&arg_order, 's') }
-	}
-	if len(f.authors) > 0 {
-		in_list(&sb, "pubkey", len(f.authors))
-		for v in f.authors { append(&str_args, v); append(&arg_order, 's') }
-	}
-	if len(f.kinds) > 0 {
-		in_list(&sb, "kind", len(f.kinds))
-		for v in f.kinds { append(&int_args, v); append(&arg_order, 'i') }
-	}
-	if f.since != 0 {
-		strings.write_string(&sb, " AND created_at >= ?")
-		append(&int_args, f.since); append(&arg_order, 'i')
-	}
-	if f.until != 0 {
-		strings.write_string(&sb, " AND created_at <= ?")
-		append(&int_args, f.until); append(&arg_order, 'i')
-	}
+@(private = "file")
+matches :: proc(s: ^Stored, f: ^Filter) -> bool {
+	if len(f.ids) > 0 && !slice.contains(f.ids, s.id) do return false
+	if len(f.authors) > 0 && !slice.contains(f.authors, s.pubkey) do return false
+	if len(f.kinds) > 0 && !slice.contains(f.kinds, s.kind) do return false
+	if f.since != 0 && s.created_at < f.since do return false
+	if f.until != 0 && s.created_at > f.until do return false
 	for tf in f.tags {
-		strings.write_string(&sb, " AND EXISTS (SELECT 1 FROM tags t WHERE t.event_id = events.id AND t.name = ? AND t.value IN (")
-		for i in 0 ..< len(tf.values) {
-			if i > 0 do strings.write_byte(&sb, ',')
-			strings.write_byte(&sb, '?')
+		hit := false
+		for t in s.tags {
+			if t[0] == tf.name && slice.contains(tf.values, t[1]) {
+				hit = true
+				break
+			}
 		}
-		strings.write_string(&sb, "))")
-		append(&str_args, tf.name); append(&arg_order, 's')
-		for v in tf.values { append(&str_args, v); append(&arg_order, 's') }
+		if !hit do return false
 	}
+	return true
+}
 
-	limit := f.limit > 0 ? f.limit : DEFAULT_LIMIT
-	strings.write_string(&sb, " ORDER BY created_at DESC, id ASC LIMIT ?")
-	append(&int_args, limit); append(&arg_order, 'i')
+// Results newest-first (created_at DESC, id ASC), temp-allocated - the
+// same contract the SQL version kept.
+query_filter :: proc(f: ^Filter) -> []Stored_Event {
+	sync.lock(&g_mu)
+	defer sync.unlock(&g_mu)
 
-	sync.lock(&g_db_mu)
-	defer sync.unlock(&g_db_mu)
-
-	stmt, pok := prep(strings.to_string(sb))
-	if !pok do return {}
-	si, ii := 0, 0
-	for kind, i in arg_order {
-		if kind == 's' {
-			bind_str(stmt, i + 1, str_args[si]); si += 1
-		} else {
-			sqlite3_bind_int64(stmt, c.int(i + 1), int_args[ii]); ii += 1
-		}
+	hits := make([dynamic]^Stored, context.temp_allocator)
+	for s in g_order {
+		if matches(s, f) do append(&hits, s)
 	}
+	slice.sort_by(hits[:], proc(a, b: ^Stored) -> bool {
+		if a.created_at != b.created_at do return a.created_at > b.created_at
+		return a.id < b.id
+	})
 
-	out := make([dynamic]Stored_Event, context.temp_allocator)
-	for sqlite3_step(stmt) == SQLITE_ROW {
-		ev: Event
-		ev.id = strings.clone_from_cstring(sqlite3_column_text(stmt, 0), context.temp_allocator)
-		ev.pubkey = strings.clone_from_cstring(sqlite3_column_text(stmt, 1), context.temp_allocator)
-		ev.created_at = sqlite3_column_int64(stmt, 2)
-		ev.kind = sqlite3_column_int64(stmt, 3)
-		ev.tags_json = strings.clone_from_cstring(sqlite3_column_text(stmt, 4), context.temp_allocator)
-		ev.content = strings.clone_from_cstring(sqlite3_column_text(stmt, 5), context.temp_allocator)
-		ev.sig = strings.clone_from_cstring(sqlite3_column_text(stmt, 6), context.temp_allocator)
-		append(&out, Stored_Event{id = ev.id, json = event_json(&ev)})
+	limit := int(f.limit > 0 ? f.limit : DEFAULT_LIMIT)
+	if len(hits) > limit do resize(&hits, limit)
+
+	out := make([]Stored_Event, len(hits), context.temp_allocator)
+	for s, i in hits {
+		out[i] = {id = strings.clone(s.id, context.temp_allocator), json = strings.clone(s.json, context.temp_allocator)}
 	}
-	sqlite3_finalize(stmt)
-	return out[:]
+	return out
 }
 
 // -- Dynamic allowlist (kind 30100 "roostr-allowlist") ----------------
 //
 // Resident (env-allowlisted) keys administer extra writer pubkeys by
-// publishing an addressable kind-30100 event whose p-tags list them:
-// space members get relay write access without a redeploy. The set is
-// the union across resident authors; refreshed at startup and whenever
-// a resident stores a fresh 30100.
+// publishing an addressable kind-30100 event whose p-tags list them.
+// Union across resident authors; refreshed at startup and whenever a
+// resident stores a fresh 30100.
 
 ALLOWLIST_KIND :: 30100
 
@@ -373,28 +418,15 @@ write_allowed :: proc(pubkey: string) -> bool {
 refresh_dynamic_allowlist :: proc() {
 	next := make(map[string]bool)
 	{
-		sync.lock(&g_db_mu)
-		defer sync.unlock(&g_db_mu)
-		stmt, pok := prep("SELECT pubkey, tags FROM events WHERE kind = ?")
-		if !pok do return
-		sqlite3_bind_int64(stmt, 1, ALLOWLIST_KIND)
-		for sqlite3_step(stmt) == SQLITE_ROW {
-			author := strings.clone_from_cstring(sqlite3_column_text(stmt, 0), context.temp_allocator)
-			if !(author in g_allowed) do continue
-			tags_json := strings.clone_from_cstring(sqlite3_column_text(stmt, 1), context.temp_allocator)
-			// Parse [["p","<hex>"],...] without a JSON dependency: scan for
-			// 64-char lowercase-hex strings following a "p" element.
-			rest := tags_json
-			for {
-				idx := strings.index(rest, `["p","`)
-				if idx < 0 do break
-				rest = rest[idx + 6:]
-				if len(rest) >= 64 && is_hex64(rest[:64]) {
-					next[strings.clone(rest[:64])] = true
-				}
+		sync.lock(&g_mu)
+		defer sync.unlock(&g_mu)
+		for s in g_order {
+			if s.kind != ALLOWLIST_KIND do continue
+			if !(s.pubkey in g_allowed) do continue
+			for t in s.tags {
+				if t[0] == "p" && is_hex64(t[1]) do next[strings.clone(t[1])] = true
 			}
 		}
-		sqlite3_finalize(stmt)
 	}
 	sync.lock(&g_dynamic_mu)
 	old := g_dynamic

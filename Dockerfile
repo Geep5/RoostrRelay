@@ -1,4 +1,4 @@
-# Builder: Odin release + static libsecp256k1 + static SQLite amalgamation.
+# Builder: Odin release + static libsecp256k1 (storage is pure Odin).
 FROM debian:bookworm-slim AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -17,13 +17,7 @@ RUN git clone --depth 1 --branch v0.6.0 https://github.com/bitcoin-core/secp256k
     && ./configure --enable-module-schnorrsig --disable-shared --disable-tests --disable-benchmark --prefix=/usr/local \
     && make -j"$(nproc)" && make install
 
-# SQLite amalgamation, static
-RUN curl -fsSL https://sqlite.org/2025/sqlite-amalgamation-3500400.zip -o /tmp/sq.zip \
-    && cd /tmp && python3 -c "import zipfile; zipfile.ZipFile('sq.zip').extractall()" 2>/dev/null \
-    || (apt-get update && apt-get install -y unzip && cd /tmp && unzip -q sq.zip) \
-    && cd /tmp/sqlite-amalgamation-3500400 \
-    && clang -c sqlite3.c -O2 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_COLUMN_METADATA -o sqlite3.o \
-    && ar rcs /usr/local/lib/libsqlite3.a sqlite3.o
+# (SQLite gone: storage is a pure-Odin append-only log - see src/store.odin.)
 
 COPY src /build/src
 RUN cd /build && odin build src -out:roostr-relay -o:speed \
