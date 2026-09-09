@@ -2,6 +2,8 @@ app = "roostr-relay"
 primary_region = "sjc"
 
 [build]
+  [build.args]
+    VERIFY_DUAL = "true" # Production soak: both verifiers must agree before acceptance.
 
 [env]
   PORT = "7777"
