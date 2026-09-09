@@ -39,6 +39,7 @@ Filter :: struct {
 	since:   i64, // 0 = unset
 	until:   i64, // 0 = unset
 	limit:   i64, // 0 = unset
+	has_limit: bool,
 }
 
 // -- Canonical serialization ------------------------------------------
@@ -140,6 +141,7 @@ parse_event :: proc(v: json.Value) -> (ev: Event, err: string) {
 	tags_arr, tok := tags_v.(json.Array)
 	if !tok do return {}, "invalid: tags is not an array"
 
+	if len(tags_arr) > MAX_TAGS do return {}, "invalid: too many tags"
 	tags := make([][]string, len(tags_arr), context.temp_allocator)
 	for tv, i in tags_arr {
 		inner, iok := tv.(json.Array)
@@ -157,22 +159,25 @@ parse_event :: proc(v: json.Value) -> (ev: Event, err: string) {
 	return ev, ""
 }
 
+MAX_FILTER_VALUES :: 256
+MAX_FILTER_CARDINALITY :: 1024
+MAX_FILTER_BYTES :: 16 << 10
+MAX_REQ_FILTER_BYTES :: 64 << 10
+
 parse_filter :: proc(v: json.Value) -> (f: Filter, ok: bool) {
 	obj, is_obj := v.(json.Object)
-	if !is_obj do return {}, false
-
+	if !is_obj || len(obj) > 64 do return {}, false
 	str_list :: proc(v: json.Value) -> ([]string, bool) {
 		arr, aok := v.(json.Array)
-		if !aok do return nil, false
+		if !aok || len(arr) > MAX_FILTER_VALUES do return nil, false
 		out := make([]string, len(arr), context.temp_allocator)
 		for item, i in arr {
 			s, sok := jstr(item)
-			if !sok do return nil, false
+			if !sok || len(s) > MAX_FILTER_BYTES do return nil, false
 			out[i] = s
 		}
 		return out, true
 	}
-
 	tag_filters := make([dynamic]Tag_Filter, context.temp_allocator)
 	for key, val in obj {
 		switch {
@@ -182,7 +187,7 @@ parse_filter :: proc(v: json.Value) -> (f: Filter, ok: bool) {
 			if f.authors, ok = str_list(val); !ok do return {}, false
 		case key == "kinds":
 			arr, aok := val.(json.Array)
-			if !aok do return {}, false
+			if !aok || len(arr) > MAX_FILTER_VALUES do return {}, false
 			f.kinds = make([]i64, len(arr), context.temp_allocator)
 			for item, i in arr {
 				n, nok := jint(item)
@@ -194,16 +199,33 @@ parse_filter :: proc(v: json.Value) -> (f: Filter, ok: bool) {
 		case key == "until":
 			if f.until, ok = jint(val); !ok do return {}, false
 		case key == "limit":
-			if f.limit, ok = jint(val); !ok do return {}, false
+			if f.limit, ok = jint(val); !ok || f.limit < 0 do return {}, false
+			f.has_limit = true
 		case len(key) == 2 && key[0] == '#':
+			ch := key[1]
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z') do return {}, false
 			vals, vok := str_list(val)
 			if !vok do return {}, false
 			append(&tag_filters, Tag_Filter{name = key[1:], values = vals})
 		}
 	}
 	f.tags = tag_filters[:]
+	cardinality := len(f.ids) + len(f.authors) + len(f.kinds)
+	for tf in f.tags do cardinality += len(tf.values)
+	if cardinality > MAX_FILTER_CARDINALITY || filter_bytes(&f) > MAX_FILTER_BYTES do return {}, false
 	if f.limit > MAX_LIMIT do f.limit = MAX_LIMIT
 	return f, true
+}
+
+filter_bytes :: proc(f: ^Filter) -> int {
+	bytes := size_of(Filter) + len(f.kinds)*size_of(i64) + len(f.tags)*size_of(Tag_Filter)
+	for s in f.ids do bytes += len(s) + size_of(string)
+	for s in f.authors do bytes += len(s) + size_of(string)
+	for tf in f.tags {
+		bytes += len(tf.name)
+		for s in tf.values do bytes += len(s) + size_of(string)
+	}
+	return bytes
 }
 
 // -- In-memory filter matching (live subscriptions) -------------------
@@ -292,7 +314,10 @@ send_closed :: proc(c: ^Conn, sub_id: string, message: string) {
 }
 
 send_event :: proc(c: ^Conn, sub_id: string, ev_json: string) -> bool {
-	sb := strings.builder_make(context.temp_allocator)
+	// ws_send copies into the owned queue before returning. Reclaim this
+	// builder immediately so broadcast fanout cannot grow message scratch.
+	sb := strings.builder_make(context.allocator)
+	defer strings.builder_destroy(&sb)
 	strings.write_string(&sb, `["EVENT",`)
 	canon_escape(&sb, sub_id)
 	strings.write_byte(&sb, ',')
@@ -346,14 +371,20 @@ handle_message :: proc(c: ^Conn, raw: string) {
 		if len(arr) < 2 do return
 		sub_id, sok := jstr(arr[1])
 		if !sok do return
-		sync.lock(&g_conns_mu)
-		sub, exists := c.subs[sub_id]
-		if exists do delete_key(&c.subs, sub_id)
-		sync.unlock(&g_conns_mu)
-		if exists do mem.dynamic_arena_destroy(&sub.arena)
+		remove_subscription(c, sub_id)
 	case:
 		send_notice(c, fmt.tprintf("invalid: unknown message type %s", verb))
 	}
+}
+
+event_write_allowed :: proc(ev: ^Event) -> bool {
+	if len(g_allowed) == 0 || write_allowed(ev.pubkey) || ev.kind == 0 do return true
+	if ev.kind == 1059 {
+		for tag in ev.tags {
+			if len(tag) >= 2 && tag[0] == "p" && write_allowed(tag[1]) do return true
+		}
+	}
+	return false
 }
 
 handle_event :: proc(c: ^Conn, v: json.Value) {
@@ -373,20 +404,9 @@ handle_event :: proc(c: ^Conn, v: json.Value) {
 	// beside the knock (replaceable: one row per pubkey, size-capped like
 	// everything else), and (3) membership in the dynamic allowlist, which
 	// resident keys administer via kind-30100 "roostr-allowlist" events.
-	if len(g_allowed) > 0 && !write_allowed(ev.pubkey) {
-		stranger_ok := ev.kind == 0
-		if ev.kind == 1059 {
-			for tag in ev.tags {
-				if len(tag) >= 2 && tag[0] == "p" && write_allowed(tag[1]) {
-					stranger_ok = true
-					break
-				}
-			}
-		}
-		if !stranger_ok {
-			send_ok(c, ev.id, false, "restricted: pubkey not on the allowlist")
-			return
-		}
+	if !event_write_allowed(&ev) {
+		send_ok(c, ev.id, false, "restricted: pubkey not on the allowlist")
+		return
 	}
 	if len(ev.content) > MAX_CONTENT {
 		send_ok(c, ev.id, false, "invalid: content too large")
@@ -398,6 +418,10 @@ handle_event :: proc(c: ^Conn, v: json.Value) {
 	}
 	if ev.created_at > unix_now() + CREATED_AT_SLOP_FUTURE {
 		send_ok(c, ev.id, false, "invalid: created_at too far in the future")
+		return
+	}
+	if len(event_json(&ev)) > MAX_RECORD {
+		send_ok(c, ev.id, false, "invalid: serialized event too large")
 		return
 	}
 
@@ -420,16 +444,23 @@ handle_event :: proc(c: ^Conn, v: json.Value) {
 			return
 		}
 		stored_msg = msg
-		if ev.kind == ALLOWLIST_KIND && (ev.pubkey in g_allowed) {
-			refresh_dynamic_allowlist()
-		}
 	}
 
 	send_ok(c, ev.id, true, stored_msg)
-	broadcast(&ev)
+	if stored_msg == "" do broadcast(&ev)
+}
+
+remove_subscription :: proc(c: ^Conn, sub_id: string) {
+	sync.lock(&g_conns_mu)
+	sub, exists := c.subs[sub_id]
+	if exists do delete_key(&c.subs, sub_id)
+	sync.unlock(&g_conns_mu)
+	if exists do mem.dynamic_arena_destroy(&sub.arena)
 }
 
 handle_req :: proc(c: ^Conn, sub_id: string, filter_values: []json.Value) {
+	// CLOSED must not leave an earlier subscription of the same ID active.
+	remove_subscription(c, sub_id)
 	if len(filter_values) > MAX_FILTERS_PER_REQ {
 		send_closed(c, sub_id, "error: too many filters")
 		return
@@ -451,6 +482,7 @@ handle_req :: proc(c: ^Conn, sub_id: string, filter_values: []json.Value) {
 	{
 		filters := make([]Filter, len(filter_values), context.temp_allocator)
 		ok := true
+		filter_size := 0
 		for v, i in filter_values {
 			f, fok := parse_filter(v)
 			if !fok {
@@ -458,6 +490,8 @@ handle_req :: proc(c: ^Conn, sub_id: string, filter_values: []json.Value) {
 				break
 			}
 			filters[i] = f
+			filter_size += filter_bytes(&f)
+			if filter_size > MAX_REQ_FILTER_BYTES { ok = false; break }
 		}
 		if !ok {
 			mem.dynamic_arena_destroy(&sub.arena)
@@ -469,15 +503,22 @@ handle_req :: proc(c: ^Conn, sub_id: string, filter_values: []json.Value) {
 
 	// Serve stored events, newest first, deduped across filters.
 	seen := make(map[string]bool, context.temp_allocator)
+	remaining := MAX_QUERY_BYTES
 	for &f in sub.filters {
-		rows := query_filter(&f)
+		rows, exhausted := query_filter(&f, remaining)
 		for row in rows {
+			remaining -= len(row.json) + QUERY_ROW_OVERHEAD
 			if row.id in seen do continue
 			seen[row.id] = true
 			if !send_event(c, sub_id, row.json) {
 				mem.dynamic_arena_destroy(&sub.arena)
 				return
 			}
+		}
+		if exhausted {
+			mem.dynamic_arena_destroy(&sub.arena)
+			send_closed(c, sub_id, "rate-limited: query response byte budget exceeded; narrow the filter")
+			return
 		}
 	}
 	{
@@ -488,14 +529,11 @@ handle_req :: proc(c: ^Conn, sub_id: string, filter_values: []json.Value) {
 		ws_send_text(c, strings.to_string(sb))
 	}
 
-	// Replace any existing sub with the same id.
+	// The reader owns subscription mutations; broadcasts only read under lock.
 	key := strings.clone(sub_id, mem.dynamic_arena_allocator(&sub.arena))
 	sync.lock(&g_conns_mu)
-	old, had_old := c.subs[sub_id]
-	if had_old do delete_key(&c.subs, sub_id)
 	c.subs[key] = sub
 	sync.unlock(&g_conns_mu)
-	if had_old do mem.dynamic_arena_destroy(&old.arena)
 }
 
 clone_strs :: proc(src: []string, allocator: mem.Allocator) -> []string {

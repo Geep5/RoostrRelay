@@ -2,8 +2,8 @@ package relay
 
 // RoostrRelay - a Nostr relay in Odin.
 //
-// One process, one thread per connection (blocking core:net, the same
-// model as glon-odin's server). TLS terminates at the Fly proxy; we
+// One process, one reader and one joined sender per WebSocket (blocking
+// core:net). TLS terminates at the Fly proxy; we
 // listen on plaintext PORT. Storage is SQLite on a local file; writes
 // are serialized under g_db_mu, WAL keeps readers unblocked.
 //
@@ -81,7 +81,7 @@ handle_connection :: proc(sock: net.TCP_Socket) {
 	context.temp_allocator = mem.dynamic_arena_allocator(&arena)
 	defer mem.dynamic_arena_destroy(&arena)
 
-	net.set_option(sock, .Send_Timeout, time.Second * 10)
+	net.set_option(sock, .Send_Timeout, WS_SEND_TIMEOUT)
 
 	req, ok := read_head(sock)
 	if !ok {
@@ -163,10 +163,17 @@ respond :: proc(sock: net.TCP_Socket, status: string, content_type: string, body
 }
 
 send_all :: proc(sock: net.TCP_Socket, data: []byte) -> bool {
+	started := time.now()
 	sent := 0
 	for sent < len(data) {
-		n, err := net.send_tcp(sock, data[sent:])
-		if err != nil || n <= 0 do return false
+		remaining := WS_SEND_TIMEOUT - time.since(started)
+		if remaining < time.Millisecond do return false
+		// Bound the whole frame/response, not each successful partial write.
+		if net.set_option(sock, .Send_Timeout, remaining) != nil do return false
+		// net.send_tcp loops internally; use one syscall so partial progress
+		// cannot reset the deadline indefinitely on a trickle-reading client.
+		n := send_once(sock, data[sent:])
+		if n <= 0 do return false
 		sent += n
 	}
 	return true

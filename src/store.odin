@@ -1,25 +1,12 @@
 package relay
 
-// Pure-Odin storage: an append-only log of framed records plus in-memory
-// indexes rebuilt on boot. No sqlite, no C.
-//
-// Why this shape fits a relay: events are immutable and content-addressed,
-// "updates" are supersedes (replaceable/addressable kinds) and NIP-09
-// deletions - both are tombstones here. The log is truth; memory mirrors
-// it. And the relay itself is a cache in the Roostr architecture (the
-// .pb files on devices are truth; harnesses republish what the relay
-// lacks at startup reconcile), so even catastrophic loss self-heals.
-//
-// Record framing:  [1B type][u32le len][payload][u32le crc32(payload)]
-//   'E'  event, payload = wire JSON (the exact bytes REQ echoes back)
-//   'T'  tombstone, payload = 64-char hex event id
-// A torn tail (crash mid-append) fails the length/CRC check and is
-// truncated on boot - everything before it is intact.
-//
-// Concurrency matches the sqlite version: one process-wide mutex over
-// both the file and the maps. At Roostr scale a reader/writer split is
-// still premature; the seam (store_open/store_event/query_filter) is
-// unchanged, so that upgrade stays a drop-in.
+// Durable append-only log. Legacy E (event) and T (event-id tombstone)
+// records remain readable. New A records commit one complete logical event
+// operation: its authorized deletions/supersession and insertion replay together.
+// Framing: [type:u8][length:u32le][payload][crc32:u32le]. A checksums header
+// plus payload; legacy E/T checksum only payload, exactly as before.
+// Incomplete EOF is recoverable; corrupt complete records are never discarded.
+// g_mu owns the file, append-failure latch and all in-memory indexes.
 
 import "core:encoding/json"
 import "core:fmt"
@@ -27,11 +14,15 @@ import "core:hash"
 import "core:os"
 import "core:slice"
 import "core:strings"
+import "core:mem"
+import "core:strconv"
 import "core:sync"
 
 g_mu: sync.Mutex
 g_fd: ^os.File
 g_log_path: string
+g_append_failed: bool
+g_deleted: map[string]bool // durable IDs, including superseded versions
 
 Stored :: struct {
 	id:         string,
@@ -48,7 +39,7 @@ g_events: map[string]^Stored
 g_order: [dynamic]^Stored
 g_tombs: int // tombstoned records currently wasting log bytes
 
-MAX_RECORD :: 1 << 19 // 512 KiB - relay caps messages far below this
+MAX_RECORD :: MAX_MESSAGE // same bound for acceptance, new writes and legacy replay
 COMPACT_MIN_TOMBS :: 1024
 
 // -- Kind routing (unchanged) -----------------------------------------
@@ -70,35 +61,47 @@ d_tag :: proc(ev: ^Event) -> string {
 
 // -- Log primitives ----------------------------------------------------
 
-@(private = "file")
-write_record :: proc(type: u8, payload: string) -> bool {
-	head: [5]u8
-	head[0] = type
-	n := u32(len(payload))
-	head[1] = u8(n)
-	head[2] = u8(n >> 8)
-	head[3] = u8(n >> 16)
-	head[4] = u8(n >> 24)
-	crc := hash.crc32(transmute([]u8)payload)
-	tail: [4]u8
-	tail[0] = u8(crc)
-	tail[1] = u8(crc >> 8)
-	tail[2] = u8(crc >> 16)
-	tail[3] = u8(crc >> 24)
-	if _, err := os.write(g_fd, head[:]); err != nil do return false
-	if _, err := os.write(g_fd, transmute([]u8)payload); err != nil do return false
-	if _, err := os.write(g_fd, tail[:]); err != nil do return false
+write_full :: proc(fd: ^os.File, data: []u8) -> bool {
+	off := 0
+	for off < len(data) {
+		n, err := os.write(fd, data[off:])
+		if err != nil || n <= 0 do return false
+		off += n
+	}
 	return true
 }
 
-@(private = "file")
-sync_log :: proc() -> bool {
-	return os.sync(g_fd) == nil
+write_record_to :: proc(fd: ^os.File, type: u8, payload: string) -> bool {
+	if len(payload) <= 0 || len(payload) > MAX_RECORD do return false
+	head: [5]u8
+	head[0] = type
+	n := u32(len(payload))
+	for i in 0..<4 do head[i+1] = u8(n >> uint(8*i))
+	seed := type == 'A' ? hash.crc32(head[:]) : u32(0)
+	crc := hash.crc32(transmute([]u8)payload, seed)
+	tail: [4]u8
+	for i in 0..<4 do tail[i] = u8(crc >> uint(8*i))
+	return write_full(fd, head[:]) && write_full(fd, transmute([]u8)payload) && write_full(fd, tail[:])
+}
+
+append_operation :: proc(wire: string) -> bool {
+	if g_append_failed || g_fd == nil do return false
+	if !write_record_to(g_fd, 'A', wire) || os.sync(g_fd) != nil {
+		// Never append beyond a possibly partial/unsynced operation. Restart
+		// replays the file before any writer may use it again.
+		g_append_failed = true
+		return false
+	}
+	return true
+}
+
+remember_deleted :: proc(id: string) {
+	if !(id in g_deleted) do g_deleted[strings.clone(id)] = true
 }
 
 // -- In-memory index ---------------------------------------------------
 
-@(private = "file")
+@(private)
 intern :: proc(ev: ^Event, wire_json: string) -> ^Stored {
 	s := new(Stored)
 	s.id = strings.clone(ev.id)
@@ -116,12 +119,16 @@ intern :: proc(ev: ^Event, wire_json: string) -> ^Stored {
 	}
 	s.tags = make([][2]string, count)
 	i := 0
+	have_d := false
 	for tag in ev.tags {
 		if len(tag) >= 2 && len(tag[0]) == 1 {
 			ch := tag[0][0]
 			if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' {
 				s.tags[i] = {strings.clone(tag[0]), strings.clone(tag[1])}
-				if tag[0] == "d" && s.d == "" do s.d = s.tags[i][1]
+				if tag[0] == "d" && !have_d {
+					s.d = s.tags[i][1]
+					have_d = true
+				}
 				i += 1
 			}
 		}
@@ -133,8 +140,9 @@ intern :: proc(ev: ^Event, wire_json: string) -> ^Stored {
 	return s
 }
 
-@(private = "file")
+@(private)
 evict :: proc(s: ^Stored) {
+	remember_deleted(s.id)
 	// Swap-remove from g_order, keeping idx fields honest.
 	last := g_order[len(g_order) - 1]
 	g_order[s.idx] = last
@@ -159,80 +167,125 @@ evict :: proc(s: ^Stored) {
 store_open :: proc(path: string) {
 	g_log_path = strings.clone(path)
 	g_events = make(map[string]^Stored)
-
-	if data, rerr := os.read_entire_file_from_path(path, context.allocator); rerr == nil {
+	g_deleted = make(map[string]bool)
+	g_append_failed = false
+	data, rerr := os.read_entire_file_from_path(path, context.allocator)
+	if rerr == nil {
 		defer delete(data)
-		// A leftover sqlite file is not ours to parse - set it aside and
-		// start fresh; harness startup reconcile repopulates the cache.
-		if len(data) >= 16 && string(data[:15]) == "SQLite format 3" {
-			bak := fmt.tprintf("%s.sqlite.bak", path)
-			_ = os.rename(path, bak)
-			fmt.printfln("[relay] found sqlite store; moved to %s and starting a fresh log", bak)
-		} else {
-			replay(data)
+		good, status := replay(data)
+		if status == .Corrupt {
+			fmt.eprintfln("[relay] FATAL: corrupt log at offset %d; original file untouched", good)
+			os.exit(1)
 		}
+		if status == .Incomplete && !replace_log(data[:good], false) {
+			fmt.eprintln("[relay] FATAL: cannot durably recover incomplete log tail")
+			os.exit(1)
+		}
+	} else if rerr != os.Error(os.General_Error.Not_Exist) {
+		fmt.eprintln("[relay] FATAL: cannot read log:", rerr)
+		os.exit(1)
 	}
-
-	if g_tombs >= COMPACT_MIN_TOMBS {
-		compact()
-	} else {
-		// Reopen for appends (replay may have truncated a torn tail).
-		reopen_for_append()
+	if g_tombs >= COMPACT_MIN_TOMBS && !compact() {
+		fmt.eprintln("[relay] FATAL: compaction failed; refusing to append")
+		os.exit(1)
 	}
-	fmt.printfln("[relay] store: %d event(s), %d tombstone(s) in log", len(g_order), g_tombs)
+	reopen_for_append()
+	fmt.printfln("[relay] store: %d live events, %d retained deleted IDs", len(g_order), len(g_deleted))
 }
 
-@(private = "file")
-replay :: proc(data: []u8) {
-	off := 0
-	good := 0 // byte offset after the last valid record
-	for off + 9 <= len(data) {
-		type := data[off]
-		n := int(data[off + 1]) | int(data[off + 2]) << 8 | int(data[off + 3]) << 16 | int(data[off + 4]) << 24
-		if (type != 'E' && type != 'T') || n <= 0 || n > MAX_RECORD || off + 5 + n + 4 > len(data) do break
-		payload := data[off + 5:off + 5 + n]
-		c := data[off + 5 + n:off + 5 + n + 4]
-		want := u32(c[0]) | u32(c[1]) << 8 | u32(c[2]) << 16 | u32(c[3]) << 24
-		if hash.crc32(payload) != want do break
+Record_Status :: enum { Complete, Incomplete, Corrupt }
 
-		switch type {
-		case 'E':
-			apply_event_record(string(payload))
-		case 'T':
+decode_record :: proc(data: []u8) -> (type: u8, payload: []u8, size: int, status: Record_Status) {
+	if len(data) == 0 do return 0, nil, 0, .Incomplete
+	type = data[0]
+	if type != 'E' && type != 'T' && type != 'A' do return type, nil, 0, .Corrupt
+	if len(data) < 5 do return type, nil, 0, .Incomplete
+	n := int(data[1]) | int(data[2]) << 8 | int(data[3]) << 16 | int(data[4]) << 24
+	if n <= 0 || n > MAX_RECORD || (type == 'T' && n != 64) do return type, nil, 0, .Corrupt
+	size = n + 9
+	if size > len(data) do return type, nil, size, .Incomplete
+	payload = data[5:5+n]
+	c := data[5+n:size]
+	want := u32(c[0]) | u32(c[1]) << 8 | u32(c[2]) << 16 | u32(c[3]) << 24
+	seed := type == 'A' ? hash.crc32(data[:5]) : u32(0)
+	if hash.crc32(payload, seed) != want do return type, payload, size, .Corrupt
+	return type, payload, size, .Complete
+}
+
+replay :: proc(data: []u8) -> (good: int, status: Record_Status) {
+	// Reclaim parse trees after each record, not after the entire log.
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	context.temp_allocator = mem.dynamic_arena_allocator(&arena)
+	for good < len(data) {
+		type, payload, size, record_status := decode_record(data[good:])
+		if record_status == .Incomplete {
+			// A damaged length must not cause a valid suffix to be discarded.
+			// Any complete CRC-valid frame beyond the failure is ambiguous:
+			// preserve the whole file and require operator recovery instead.
+			for i := good+1; i+9 <= len(data); i += 1 {
+				_, _, _, suffix_status := decode_record(data[i:])
+				if suffix_status == .Complete do return good, .Corrupt
+			}
+			return good, .Incomplete
+		}
+		if record_status == .Corrupt do return good, .Corrupt
+		if type == 'T' {
+			if !is_hex64(string(payload)) do return good, .Corrupt
+			remember_deleted(string(payload))
 			if s, have := g_events[string(payload)]; have do evict(s)
+		} else {
+			v, jerr := json.parse(payload, .JSON, false, context.temp_allocator)
+			if jerr != nil do return good, .Corrupt
+			ev, perr := parse_event(v)
+			if perr != "" do return good, .Corrupt
+			if type == 'A' {
+				victims, message, _ := plan_operation(&ev)
+				if message == "" do apply_operation(&ev, string(payload), victims[:])
+			} else if !(ev.id in g_events) && !(ev.id in g_deleted) {
+				_ = intern(&ev, string(payload))
+			}
 		}
-		off += 5 + n + 4
-		good = off
+		good += size
+		free_all(context.temp_allocator)
 	}
-	if good < len(data) {
-		fmt.printfln("[relay] log: truncating %d torn byte(s) at offset %d", len(data) - good, good)
-		truncate_log(good, data[:good])
-	}
+	return good, .Complete
 }
 
-@(private = "file")
-apply_event_record :: proc(wire: string) {
-	v, jerr := json.parse(transmute([]u8)wire, .JSON, false, context.temp_allocator)
-	if jerr != nil do return
-	ev, perr := parse_event(v)
-	if perr != "" do return
-	if _, have := g_events[ev.id]; have do return
-	_ = intern(&ev, wire)
+sync_log_directory :: proc() -> bool {
+	fd, err := os.open(os.dir(g_log_path), {.Read}, os.Permissions_Default_File)
+	if err != nil do return false
+	ok := os.sync(fd) == nil
+	return os.close(fd) == nil && ok
 }
 
-@(private = "file")
-truncate_log :: proc(size: int, good: []u8) {
-	// os.truncate is not portable across Odin targets; rewrite is - and a
-	// torn tail is a rare crash artifact, not a hot path.
+// Only a fully written, synced and closed temporary file may replace the log.
+// A post-rename directory-sync error is fatal too: no appends may follow it.
+replace_log :: proc(prefix: []u8, compacting: bool) -> bool {
 	tmp := fmt.tprintf("%s.tmp", g_log_path)
-	if os.write_entire_file(tmp, good) != nil {
-		fmt.eprintln("[relay] log: could not rewrite torn tail; keeping as-is")
-		return
+	fd, err := os.open(tmp, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
+	if err != nil do return false
+	ok := true
+	if compacting {
+		for id in g_deleted {
+			if !write_record_to(fd, 'T', id) { ok = false; break }
+		}
+		if ok {
+			for s in g_order {
+				if !write_record_to(fd, 'E', s.json) { ok = false; break }
+			}
+		}
+	} else {
+		ok = write_full(fd, prefix)
 	}
-	if os.rename(tmp, g_log_path) != nil do fmt.eprintln("[relay] log: rename failed after tail rewrite")
+	if ok do ok = os.sync(fd) == nil
+	if os.close(fd) != nil do ok = false
+	if !ok { _ = os.remove(tmp); return false }
+	if os.rename(tmp, g_log_path) != nil { _ = os.remove(tmp); return false }
+	return sync_log_directory()
 }
 
-@(private = "file")
 reopen_for_append :: proc() {
 	fd, err := os.open(g_log_path, {.Write, .Create, .Append}, os.Permissions_Default_File)
 	if err != nil {
@@ -240,39 +293,16 @@ reopen_for_append :: proc() {
 		os.exit(1)
 	}
 	g_fd = fd
+	if os.sync(fd) != nil || !sync_log_directory() {
+		fmt.eprintln("[relay] FATAL: cannot sync log and directory")
+		os.exit(1)
+	}
 }
 
-/** Rewrite the log with only live events; tombstones and their victims
- *  vanish. Boot-only, before the socket opens - no concurrency. */
-@(private = "file")
-compact :: proc() {
-	tmp := fmt.tprintf("%s.tmp", g_log_path)
-	fd, err := os.open(tmp, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
-	if err != nil {
-		fmt.eprintln("[relay] compact: cannot open tmp, keeping log as-is:", err)
-		reopen_for_append()
-		return
-	}
-	g_fd = fd
-	ok := true
-	for s in g_order {
-		if !write_record('E', s.json) {
-			ok = false
-			break
-		}
-	}
-	if !ok || os.sync(g_fd) != nil {
-		fmt.eprintln("[relay] compact failed; keeping original log")
-		os.close(g_fd)
-		_ = os.remove(tmp)
-		reopen_for_append()
-		return
-	}
-	os.close(g_fd)
-	if os.rename(tmp, g_log_path) != nil do fmt.eprintln("[relay] compact: rename failed; log may be stale")
-	fmt.printfln("[relay] compacted: %d live event(s), %d tombstone(s) dropped", len(g_order), g_tombs)
+compact :: proc() -> bool {
+	if !replace_log(nil, true) do return false
 	g_tombs = 0
-	reopen_for_append()
+	return true
 }
 
 // -- store_event -------------------------------------------------------
@@ -281,64 +311,75 @@ compact :: proc() {
 // fsyncs before the maps change, so memory never claims what the disk
 // could lose.
 
+// NIP-09 address identifiers may themselves contain colons. Split only the
+// kind and author fields; compare the remaining d value verbatim.
+deletion_tag_matches :: proc(name, value, author: string, cutoff: i64, id, pubkey: string, kind: i64, d: string, created_at: i64) -> bool {
+	if pubkey != author || kind == 5 do return false
+	if name == "e" do return value == id
+	if name != "a" || !is_addressable(kind) || created_at > cutoff do return false
+	first := strings.index(value, ":")
+	if first < 0 do return false
+	rest := value[first+1:]
+	second := strings.index(rest, ":")
+	if second < 0 || rest[:second] != author || rest[second+1:] != d do return false
+	k, ok := strconv.parse_int(value[:first])
+	return ok && i64(k) == kind
+}
+
+plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: string, rejected: bool) {
+	if ev.id in g_events do return nil, "duplicate: already have this event", false
+	if ev.id in g_deleted do return nil, "blocked: event was deleted", true
+	for deletion in g_order {
+		if deletion.kind != 5 || deletion.pubkey != ev.pubkey do continue
+		for tag in deletion.tags {
+			if deletion_tag_matches(tag[0], tag[1], deletion.pubkey, deletion.created_at, ev.id, ev.pubkey, ev.kind, d_tag(ev), ev.created_at) {
+				return nil, "blocked: event was deleted", true
+			}
+		}
+	}
+	victims = make([dynamic]^Stored, context.temp_allocator)
+	d := is_addressable(ev.kind) ? d_tag(ev) : ""
+	// Visit each stored event exactly once. Repeated e/a tags can never
+	// produce duplicate pointers (and therefore cannot double-free victims).
+	for s in g_order {
+		victim := false
+		if (is_replaceable(ev.kind) || is_addressable(ev.kind)) && s.pubkey == ev.pubkey && s.kind == ev.kind && (!is_addressable(ev.kind) || s.d == d) {
+			if s.created_at > ev.created_at || (s.created_at == ev.created_at && s.id < ev.id) {
+				return victims, "duplicate: have a newer version", false
+			}
+			victim = true
+		}
+		if ev.kind == 5 {
+			for tag in ev.tags {
+				if len(tag) >= 2 && deletion_tag_matches(tag[0], tag[1], ev.pubkey, ev.created_at, s.id, s.pubkey, s.kind, s.d, s.created_at) {
+					victim = true
+					break
+				}
+			}
+		}
+		if victim do append(&victims, s)
+	}
+	return victims, "", false
+}
+
+apply_operation :: proc(ev: ^Event, wire: string, victims: []^Stored) {
+	for s in victims do evict(s)
+	_ = intern(ev, wire)
+}
+
 store_event :: proc(ev: ^Event) -> (ok: bool, message: string) {
 	sync.lock(&g_mu)
 	defer sync.unlock(&g_mu)
-
-	if _, have := g_events[ev.id]; have {
-		return true, "duplicate: already have this event"
-	}
-
-	// Replaceable/addressable: reject if we hold a newer (or same-age,
-	// lower-id) version; otherwise the older one is superseded.
-	supersede: ^Stored
-	if is_replaceable(ev.kind) || is_addressable(ev.kind) {
-		d := is_addressable(ev.kind) ? d_tag(ev) : ""
-		for s in g_order {
-			if s.pubkey != ev.pubkey || s.kind != ev.kind do continue
-			if is_addressable(ev.kind) && s.d != d do continue
-			if s.created_at > ev.created_at || (s.created_at == ev.created_at && s.id < ev.id) {
-				return true, "duplicate: have a newer version"
-			}
-			supersede = s
-		}
-	}
-
-	// NIP-09: collect victims first; the deletion event itself stores too.
-	victims := make([dynamic]^Stored, context.temp_allocator)
-	if ev.kind == 5 {
-		for tag in ev.tags {
-			if len(tag) < 2 do continue
-			if tag[0] == "e" {
-				if s, have := g_events[tag[1]]; have && s.pubkey == ev.pubkey && s.kind != 5 {
-					append(&victims, s)
-				}
-			} else if tag[0] == "a" {
-				parts := strings.split(tag[1], ":", context.temp_allocator)
-				if len(parts) != 3 || parts[1] != ev.pubkey do continue
-				for s in g_order {
-					if s.pubkey != ev.pubkey do continue
-					if fmt.tprintf("%d", s.kind) != parts[0] do continue
-					if s.d != parts[2] || s.created_at > ev.created_at do continue
-					append(&victims, s)
-				}
-			}
-		}
-	}
-
+	if g_append_failed do return false, "error: storage requires recovery"
+	// A revocation may have committed while signature verification ran.
+	if !event_write_allowed(ev) do return false, "restricted: pubkey not on the allowlist"
 	wire := event_json(ev)
-	if supersede != nil && !write_record('T', supersede.id) {
-		return false, "error: storage failure"
-	}
-	for s in victims {
-		if !write_record('T', s.id) do return false, "error: storage failure"
-	}
-	if !write_record('E', wire) do return false, "error: storage failure"
-	if !sync_log() do return false, "error: storage failure"
-
-	if supersede != nil do evict(supersede)
-	for s in victims do evict(s)
-	_ = intern(ev, wire)
+	if len(wire) > MAX_RECORD do return false, "invalid: serialized event too large"
+	victims, msg, rejected := plan_operation(ev)
+	if msg != "" do return !rejected, msg
+	if !append_operation(wire) do return false, "error: storage failure"
+	apply_operation(ev, wire, victims[:])
+	if ev.kind == 5 || ev.kind == ALLOWLIST_KIND do refresh_dynamic_allowlist_locked()
 	return true, ""
 }
 
@@ -371,29 +412,64 @@ matches :: proc(s: ^Stored, f: ^Filter) -> bool {
 	return true
 }
 
-// Results newest-first (created_at DESC, id ASC), temp-allocated - the
-// same contract the SQL version kept.
-query_filter :: proc(f: ^Filter) -> []Stored_Event {
+MAX_QUERY_BYTES :: 8 << 20
+// Includes escaped subscription ID, EVENT envelope, copied ID and metadata.
+QUERY_ROW_OVERHEAD :: 512
+
+stored_before :: proc(a, b: ^Stored) -> bool {
+	if a.created_at != b.created_at do return a.created_at > b.created_at
+	return a.id < b.id
+}
+
+// A worst-first heap retains at most MAX_LIMIT pointers regardless of total
+// matches. Clone only a byte-budgeted prefix after sorting those candidates.
+query_filter :: proc(f: ^Filter, byte_budget := MAX_QUERY_BYTES) -> (rows: []Stored_Event, exhausted: bool) {
 	sync.lock(&g_mu)
 	defer sync.unlock(&g_mu)
-
-	hits := make([dynamic]^Stored, context.temp_allocator)
+	limit := int(f.has_limit || f.limit > 0 ? f.limit : DEFAULT_LIMIT)
+	limit = clamp(limit, 0, MAX_LIMIT)
+	if limit == 0 do return nil, false
+	storage: [MAX_LIMIT]^Stored
+	count := 0
 	for s in g_order {
-		if matches(s, f) do append(&hits, s)
+		if !matches(s, f) do continue
+		if count < limit {
+			i := count
+			count += 1
+			storage[i] = s
+			for i > 0 {
+				parent := (i-1)/2
+				if !stored_before(storage[parent], storage[i]) do break
+				storage[parent], storage[i] = storage[i], storage[parent]
+				i = parent
+			}
+		} else if stored_before(s, storage[0]) {
+			storage[0] = s
+			i := 0
+			for 2*i+1 < count {
+				child := 2*i+1
+				if child+1 < count && stored_before(storage[child], storage[child+1]) do child += 1
+				if !stored_before(storage[i], storage[child]) do break
+				storage[i], storage[child] = storage[child], storage[i]
+				i = child
+			}
+		}
 	}
-	slice.sort_by(hits[:], proc(a, b: ^Stored) -> bool {
-		if a.created_at != b.created_at do return a.created_at > b.created_at
-		return a.id < b.id
-	})
-
-	limit := int(f.limit > 0 ? f.limit : DEFAULT_LIMIT)
-	if len(hits) > limit do resize(&hits, limit)
-
-	out := make([]Stored_Event, len(hits), context.temp_allocator)
-	for s, i in hits {
-		out[i] = {id = strings.clone(s.id, context.temp_allocator), json = strings.clone(s.json, context.temp_allocator)}
+	hits := storage[:count]
+	slice.sort_by(hits, stored_before)
+	bytes := 0
+	returned := 0
+	for s in hits {
+		cost := len(s.json) + QUERY_ROW_OVERHEAD
+		if cost > byte_budget-bytes { exhausted = true; break }
+		bytes += cost
+		returned += 1
 	}
-	return out
+	rows = make([]Stored_Event, returned, context.temp_allocator)
+	for s, i in hits[:returned] {
+		rows[i] = {id = strings.clone(s.id, context.temp_allocator), json = strings.clone(s.json, context.temp_allocator)}
+	}
+	return rows, exhausted
 }
 
 // -- Dynamic allowlist (kind 30100 "roostr-allowlist") ----------------
@@ -416,25 +492,29 @@ write_allowed :: proc(pubkey: string) -> bool {
 }
 
 refresh_dynamic_allowlist :: proc() {
+	sync.lock(&g_mu)
+	defer sync.unlock(&g_mu)
+	refresh_dynamic_allowlist_locked()
+}
+
+// Called with g_mu held, including publication: an older snapshot can never
+// overwrite a newer revocation. Lock order is always g_mu -> g_dynamic_mu.
+refresh_dynamic_allowlist_locked :: proc() {
 	next := make(map[string]bool)
-	{
-		sync.lock(&g_mu)
-		defer sync.unlock(&g_mu)
-		for s in g_order {
-			if s.kind != ALLOWLIST_KIND do continue
-			if !(s.pubkey in g_allowed) do continue
-			for t in s.tags {
-				if t[0] == "p" && is_hex64(t[1]) do next[strings.clone(t[1])] = true
-			}
+	for s in g_order {
+		if s.kind != ALLOWLIST_KIND || !(s.pubkey in g_allowed) do continue
+		for t in s.tags {
+			if t[0] == "p" && is_hex64(t[1]) && !(t[1] in next) do next[strings.clone(t[1])] = true
 		}
 	}
+	count := len(next)
 	sync.lock(&g_dynamic_mu)
 	old := g_dynamic
 	g_dynamic = next
 	sync.unlock(&g_dynamic_mu)
 	if old != nil {
-		for k, _ in old do delete_key(&old, k)
+		for k in old do delete(k)
 		delete(old)
 	}
-	fmt.printfln("[relay] dynamic allowlist: %d pubkey(s)", len(next))
+	fmt.printfln("[relay] dynamic allowlist: %d pubkey(s)", count)
 }

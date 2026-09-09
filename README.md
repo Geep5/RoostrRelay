@@ -20,14 +20,40 @@ Fly proxy (TLS)  →  plaintext :7777
         └── CRC-framed event log + in-memory lookup  →  /data/relay.db
 ```
 
-- Thread per connection (blocking `core:net`), one store mutex at personal
-  scale. The historical `DB_PATH` filename now contains an event log, not SQLite.
+- One reader and one joined sender per WebSocket, with a bounded outbound queue;
+  no blocking socket writes under the subscription registry lock. The store is
+  serialized under one mutex. `DB_PATH` contains an event log, not SQLite.
 - Kinds: regular stored; 0/3/1xxxx replaceable; 2xxxx ephemeral
   (broadcast only); 3xxxx addressable per (pubkey, kind, d). NIP-09
   deletion honored for the author's own events.
-- Caps: 1 MiB message, 900 KiB content (Roostr snapshots fit), 32
-  subs/conn, 10 filters/REQ, limit ≤ 1000. Server pings every 30s,
-  drops silent connections, 10s send timeout bounds slow consumers.
+- Caps: 1 MiB inbound message/serialized event, 900 KiB content, 32 subscriptions
+  per connection, 10 filters/REQ, limit ≤ 1000, and 8 MiB total query response
+  budget. Filter arrays and retained filter bytes are bounded. Budget exhaustion
+  returns `CLOSED`, not a false `EOSE`. Outbound queues include in-flight bytes
+  and are capped at 10 MiB; slow consumers have a total write deadline.
+- Control frames require FIN and ≤125 bytes, and per-frame scratch memory is
+  reclaimed even for control-only traffic. Fragment counts and bytes are bounded.
+
+## Storage upgrades and recovery
+
+Back up the log before upgrading. The reader accepts legacy `E`/`T` records;
+new `A` records atomically describe an event and its derived deletion/replacement
+effects. Their CRC covers header and payload. Writes must complete and sync
+before memory changes; an I/O failure latches the writer closed until recovery.
+Incomplete EOF tails can be repaired. Complete corruption preserves the original
+file and fails startup instead of silently discarding the suffix.
+
+Compaction preserves deleted IDs and deletion requests so removed events cannot
+be restored by republishing them. It checks file and directory sync/rename errors.
+It is boot-triggered after sufficient tombstones; canonical history has no TTL.
+
+**Never roll back to the pre-`A` binary against an upgraded log:** the old reader
+would treat new records as a torn tail. Restore a matching pre-upgrade backup or
+use an explicit conversion when rolling back.
+
+These bounds are not a public subscription/quota system. Anonymous profile and
+join-envelope admission still needs product-specific rate/storage quotas before
+unrestricted public registration.
 
 ## Config (env)
 
