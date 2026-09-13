@@ -1,7 +1,7 @@
 # RoostrRelay
 
 A Nostr relay in Odin. One process, one Fly.io machine, an append-only log on a
-volume. Backs [Roostr](https://getroostr.fly.dev) sync - writes are
+volume. Backs [Roostr](https://roostr.space) sync - writes are
 restricted to allowlisted pubkeys, reads are open (payloads are NIP-44
 encrypted upstream anyway).
 
