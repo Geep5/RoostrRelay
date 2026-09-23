@@ -53,7 +53,10 @@ ANON_MAX_GIFTS_PER_TARGET :: 64
 
 MAX_RECORD :: MAX_MESSAGE // same bound for acceptance, new writes and legacy replay
 COMPACT_MIN_TOMBS :: 1024
-MAX_PLAN_TAGS :: 256 // tags of one event examined by plan_operation
+// Tags of one event examined by plan_operation. A kind-5 over this bound is
+// REJECTED rather than partially applied: a silently truncated deletion
+// leaves the client believing the relay dropped events it still serves.
+MAX_PLAN_TAGS :: 256
 
 // -- Kind routing (unchanged) -----------------------------------------
 
@@ -369,9 +372,8 @@ plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: strin
 			victim = true
 		}
 		if ev.kind == 5 {
-			// Only the first MAX_PLAN_TAGS tags of a kind-5 are honoured and a
-			// single deletion retires at most MAX_LIMIT events; either excess
-			// is absurd at this scale and silently ignored.
+			// Tag count is checked in store_event; a single deletion still
+			// retires at most MAX_LIMIT events, absurd at this scale.
 			for tag, i in ev.tags {
 				if i >= MAX_PLAN_TAGS || len(victims) >= MAX_LIMIT do break
 				if len(tag) >= 2 && deletion_tag_matches(tag[0], tag[1], ev.pubkey, ev.created_at, s.id, s.pubkey, s.kind, s.d, s.created_at) {
@@ -422,6 +424,7 @@ store_event :: proc(ev: ^Event) -> (ok: bool, message: string) {
 	if !event_write_allowed(ev) do return false, "restricted: pubkey not on the allowlist"
 	wire := event_json(ev)
 	if len(wire) > MAX_RECORD do return false, "invalid: serialized event too large"
+	if ev.kind == 5 && len(ev.tags) > MAX_PLAN_TAGS do return false, fmt.tprintf("invalid: deletion lists more than %d tags", MAX_PLAN_TAGS)
 	if gift_inbox_full(ev) do return false, "blocked: recipient gift inbox is full"
 	victims, msg, rejected := plan_operation(ev)
 	if msg != "" do return !rejected, msg

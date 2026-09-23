@@ -330,6 +330,38 @@ when ODIN_TEST {
 	}
 
 	@(test)
+	store_rejects_deletion_beyond_plan_tags :: proc(t: ^testing.T) {
+		sync.lock(&store_test_mu)
+		defer sync.unlock(&store_test_mu)
+		store_test_reset()
+		defer store_test_cleanup()
+		// One more victim than the planner examines: accepting the request
+		// would delete the first MAX_PLAN_TAGS and silently keep the last.
+		count := MAX_PLAN_TAGS + 1
+		tags := make([][]string, count, context.temp_allocator)
+		for i in 0..<count {
+			victim := store_test_event(i + 1)
+			_ = intern(&victim, event_json(&victim))
+			tag := make([]string, 2, context.temp_allocator)
+			tag[0] = "e"
+			tag[1] = fmt.tprintf("%064x", i + 1)
+			tags[i] = tag
+		}
+		del := store_test_event(count + 1, 5, 20)
+		del.tags = tags
+		del.tags_json = canon_tags(del.tags)
+		ok, message := store_event(&del)
+		testing.expect(t, !ok && strings.contains(message, "more than"))
+		testing.expect_value(t, len(g_order), count)
+		// Exactly at the bound the whole request applies.
+		del.tags = tags[:MAX_PLAN_TAGS]
+		del.tags_json = canon_tags(del.tags)
+		victims, msg, rejected := plan_operation(&del)
+		testing.expect(t, msg == "" && !rejected)
+		testing.expect_value(t, len(victims), MAX_PLAN_TAGS)
+	}
+
+	@(test)
 	store_append_failure_latches :: proc(t: ^testing.T) {
 		sync.lock(&store_test_mu)
 		defer sync.unlock(&store_test_mu)
