@@ -16,10 +16,14 @@ when ODIN_TEST {
 	store_test_reset :: proc() {
 		for len(g_order) > 0 do evict(g_order[len(g_order)-1])
 		delete(g_order)
+		delete(g_deletions)
+		delete(g_deletion_refs)
 		delete(g_events)
 		for id in g_deleted do delete(id)
 		delete(g_deleted)
 		g_order = nil
+		g_deletions = nil
+		g_deletion_refs = nil
 		g_events = make(map[string]^Stored)
 		g_deleted = make(map[string]bool)
 		g_tombs = 0
@@ -310,7 +314,7 @@ when ODIN_TEST {
 		victim.tags_json = canon_tags(victim.tags)
 		_ = intern(&victim, event_json(&victim))
 		del := store_test_event(2, 5, 20)
-		del.tags = [][]string{{"e", victim.id}, {"e", victim.id}, {"a", fmt.tprintf("30078:%s:part:one", victim.pubkey)}}
+		del.tags = [][]string{{"e", victim.id}, {"e", victim.id}, {"a", fmt.tprintf("30078:%s:part:one", victim.pubkey)}, {"e", fmt.tprintf("%064x", 5)}}
 		del.tags_json = canon_tags(del.tags)
 		victims, message, rejected := plan_operation(&del)
 		testing.expect(t, message == "" && !rejected && len(victims) == 1)
@@ -326,6 +330,14 @@ when ODIN_TEST {
 		late.created_at = 21
 		_, message, rejected = plan_operation(&late)
 		testing.expect(t, !rejected && message == "")
+		// An e tag naming an ID never stored blocks only its author's copy.
+		unknown := store_test_event(5)
+		_, message, rejected = plan_operation(&unknown)
+		testing.expect(t, rejected && message == "blocked: event was deleted")
+		unknown.pubkey = strings.repeat("b", 64, context.temp_allocator)
+		_, message, rejected = plan_operation(&unknown)
+		testing.expect(t, !rejected && message == "")
+		unknown.pubkey = victim.pubkey
 		// Deletion events themselves cannot be deleted.
 		delete_delete := store_test_event(4, 5, 30)
 		delete_delete.tags = [][]string{{"e", del.id}, {"e", del.id}}
@@ -351,6 +363,8 @@ when ODIN_TEST {
 		testing.expect(t, rejected)
 		late.created_at = 10
 		_, _, rejected = plan_operation(&late)
+		testing.expect(t, rejected)
+		_, _, rejected = plan_operation(&unknown)
 		testing.expect(t, rejected)
 	}
 
@@ -423,6 +437,15 @@ when ODIN_TEST {
 		late = store_test_tagged(18, owner, 1, [][]string{{"h", space}}, 60)
 		_, message, rejected = plan_operation(&late)
 		testing.expect(t, rejected && message == "blocked: event was deleted")
+		// Deletion requests are never victims: members backfilling
+		// {kinds:[5], #h:[T]} read the owner's request as "space deleted".
+		f := Filter{kinds = []i64{5}, tags = []Tag_Filter{{name = "h", values = []string{space}}}}
+		rows, _ := query_filter(&f)
+		testing.expect_value(t, len(rows), 3)
+		f.authors = []string{owner}
+		rows, _ = query_filter(&f)
+		testing.expect_value(t, len(rows), 2)
+		testing.expect(t, rows[0].id == owner_wipe.id && rows[1].id == owner_delete.id)
 	}
 
 	store_test_expect_space_gone :: proc(t: ^testing.T, count, kept: int, late: ^Event) {

@@ -35,11 +35,14 @@ Stored :: struct {
 	tags:       [][2]string, // retained_tag subset: indexed single-letter tags + ["owner", pk]
 	json:       string, // wire JSON, echoed verbatim by REQ
 	anon:       bool, // admitted via the stranger doors, counts against g_anon_bytes
+	space_deletion: bool, // kind-5 with ["h", _] tags (see space_deletion_covers)
 	idx:        int, // position in g_order (swap-remove bookkeeping)
 }
 
 g_events: map[string]^Stored
 g_order: [dynamic]^Stored
+g_deletions: [dynamic]^Stored // retained kind-5 requests, the only events that block arrivals
+g_deletion_refs: map[string]int // author+id of each retained ["e", id] -> request count
 g_tombs: int // tombstoned records currently wasting log bytes
 g_anon_bytes: int // retained wire bytes from anonymous (non-allowlisted) writers
 
@@ -152,12 +155,46 @@ intern :: proc(ev: ^Event, wire_json: string) -> ^Stored {
 		i += 1
 	}
 	s.anon = anonymous_writer(ev)
+	s.space_deletion = is_space_deletion(ev)
 	if s.anon do g_anon_bytes += len(s.json)
 
 	s.idx = len(g_order)
 	append(&g_order, s)
+	if s.kind == 5 do index_deletion(s)
 	g_events[s.id] = s
 	return s
+}
+
+// Arrivals look up e references instead of rescanning every retained
+// request's tags: boot replay plans each record, so that scan was
+// O(records x retained e tags).
+index_deletion :: proc(s: ^Stored) {
+	append(&g_deletions, s)
+	for t in s.tags {
+		if t[0] != "e" do continue
+		key := strings.concatenate({s.pubkey, t[1]})
+		if key in g_deletion_refs {
+			g_deletion_refs[key] += 1
+			delete(key)
+		} else {
+			g_deletion_refs[key] = 1
+		}
+	}
+}
+
+unindex_deletion :: proc(s: ^Stored) {
+	for deletion, i in g_deletions {
+		if deletion == s { unordered_remove(&g_deletions, i); break }
+	}
+	for t in s.tags {
+		if t[0] != "e" do continue
+		key := strings.concatenate({s.pubkey, t[1]}, context.temp_allocator)
+		g_deletion_refs[key] -= 1
+		if g_deletion_refs[key] == 0 {
+			owned, _ := delete_key(&g_deletion_refs, key)
+			delete(owned)
+		}
+	}
 }
 
 @(private)
@@ -168,6 +205,7 @@ evict :: proc(s: ^Stored) {
 	g_order[s.idx] = last
 	last.idx = s.idx
 	pop(&g_order)
+	if s.kind == 5 do unindex_deletion(s)
 	delete_key(&g_events, s.id)
 
 	if s.anon do g_anon_bytes -= len(s.json)
@@ -355,6 +393,16 @@ tag_present :: proc(tags: []$T, name, value: string) -> bool {
 	return false
 }
 
+// Only these kind-5s consult space_deletion_covers: an e/a-only deletion
+// (the common case) never pays a second pass over its tags.
+is_space_deletion :: proc(ev: ^Event) -> bool {
+	if ev.kind != 5 do return false
+	for tag in ev.tags {
+		if len(tag) >= 2 && tag[0] == "h" do return true
+	}
+	return false
+}
+
 // Space deletion: a kind-5 signed by `author` with ["h", T] tags covers every
 // non-kind-5 event tagged ["h", T] that `author` wrote or that consents with
 // ["owner", author]. The consent tag is signed by the event's own author, so
@@ -384,23 +432,52 @@ plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: strin
 	if ev.id in g_deleted do return nil, "blocked: event was deleted", true
 	// Hoisted out of every inner loop below: d_tag(ev) is a per-event scan.
 	ev_d := d_tag(ev)
-	for deletion in g_order {
-		if deletion.kind != 5 do continue
-		if space_deletion_covers(deletion.tags, deletion.pubkey, ev.tags, ev.pubkey, ev.kind) {
+	ev_space_deletion := is_space_deletion(ev)
+	// Replay plans every record: arrivals consult the e-reference index and
+	// only retained deletions, and regular kinds (which displace nothing)
+	// skip the store scan below.
+	if ev.kind != 5 && strings.concatenate({ev.pubkey, ev.id}, context.temp_allocator) in g_deletion_refs {
+		return nil, "blocked: event was deleted", true
+	}
+	for deletion in g_deletions {
+		if deletion.space_deletion && space_deletion_covers(deletion.tags, deletion.pubkey, ev.tags, ev.pubkey, ev.kind) {
 			return nil, "blocked: event was deleted", true
 		}
-		if deletion.pubkey != ev.pubkey do continue
+		if deletion.pubkey != ev.pubkey || !is_addressable(ev.kind) do continue
 		for tag in deletion.tags {
-			if deletion_tag_matches(tag[0], tag[1], deletion.pubkey, deletion.created_at, ev.id, ev.pubkey, ev.kind, ev_d, ev.created_at) {
+			if tag[0] == "a" && deletion_tag_matches(tag[0], tag[1], deletion.pubkey, deletion.created_at, ev.id, ev.pubkey, ev.kind, ev_d, ev.created_at) {
 				return nil, "blocked: event was deleted", true
 			}
 		}
 	}
 	victims = make([dynamic]^Stored, context.temp_allocator)
+	// Tag count is checked in store_event. Victims are uncapped: e/a tags
+	// name at most MAX_PLAN_TAGS live events, and a space deletion must
+	// leave no survivor. The A record logs only the kind-5; replay
+	// re-derives this same set, so one record removes a space of any size
+	// atomically. e tags name their events, so they are looked up; `named`
+	// keeps repeated e tags from producing duplicate pointers (and therefore
+	// double frees), and the store scan only runs for a/h tags.
+	scan := is_replaceable(ev.kind) || is_addressable(ev.kind) || ev_space_deletion
+	named := make(map[^Stored]bool, context.temp_allocator)
+	if ev.kind == 5 {
+		for tag, i in ev.tags {
+			if i >= MAX_PLAN_TAGS do break
+			if len(tag) < 2 do continue
+			if tag[0] == "a" do scan = true
+			if tag[0] != "e" do continue
+			s, stored := g_events[tag[1]]
+			if !stored || s in named do continue
+			if deletion_tag_matches(tag[0], tag[1], ev.pubkey, ev.created_at, s.id, s.pubkey, s.kind, s.d, s.created_at) {
+				named[s] = true
+				append(&victims, s)
+			}
+		}
+	}
+	if !scan do return victims, "", false
 	d := is_addressable(ev.kind) ? ev_d : ""
-	// Visit each stored event exactly once. Repeated e/a tags can never
-	// produce duplicate pointers (and therefore cannot double-free victims).
 	for s in g_order {
+		if s in named do continue
 		victim := false
 		if (is_replaceable(ev.kind) || is_addressable(ev.kind)) && s.pubkey == ev.pubkey && s.kind == ev.kind && (!is_addressable(ev.kind) || s.d == d) {
 			if s.created_at > ev.created_at || (s.created_at == ev.created_at && s.id < ev.id) {
@@ -409,15 +486,10 @@ plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: strin
 			victim = true
 		}
 		if ev.kind == 5 {
-			// Tag count is checked in store_event. Victims are uncapped: e/a
-			// tags name at most MAX_PLAN_TAGS live events, and a space
-			// deletion must leave no survivor. The A record logs only the
-			// kind-5; replay re-derives this same set, so one record removes
-			// a space of any size atomically.
-			if space_deletion_covers(ev.tags, ev.pubkey, s.tags, s.pubkey, s.kind) do victim = true
+			if ev_space_deletion && space_deletion_covers(ev.tags, ev.pubkey, s.tags, s.pubkey, s.kind) do victim = true
 			for tag, i in ev.tags {
 				if victim || i >= MAX_PLAN_TAGS do break
-				if len(tag) >= 2 && deletion_tag_matches(tag[0], tag[1], ev.pubkey, ev.created_at, s.id, s.pubkey, s.kind, s.d, s.created_at) do victim = true
+				if len(tag) >= 2 && tag[0] == "a" && deletion_tag_matches(tag[0], tag[1], ev.pubkey, ev.created_at, s.id, s.pubkey, s.kind, s.d, s.created_at) do victim = true
 			}
 		}
 		if victim do append(&victims, s)
