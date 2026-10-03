@@ -32,7 +32,7 @@ Stored :: struct {
 	created_at: i64,
 	kind:       i64,
 	d:          string, // addressable identity ("" otherwise)
-	tags:       [][2]string, // single-letter tags only (the indexed set)
+	tags:       [][2]string, // retained_tag subset: indexed single-letter tags + ["owner", pk]
 	json:       string, // wire JSON, echoed verbatim by REQ
 	anon:       bool, // admitted via the stranger doors, counts against g_anon_bytes
 	idx:        int, // position in g_order (swap-remove bookkeeping)
@@ -117,6 +117,17 @@ remember_deleted :: proc(id: string) {
 
 // -- In-memory index ---------------------------------------------------
 
+// Stored tags: single-letter tags (the filterable set) plus ["owner", pk]
+// consent tags, which space deletions read. Filters only name single
+// letters, so retaining "owner" never changes REQ results.
+retained_tag :: proc(tag: []string) -> bool {
+	if len(tag) < 2 do return false
+	if tag[0] == "owner" do return true
+	if len(tag[0]) != 1 do return false
+	ch := tag[0][0]
+	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
+}
+
 @(private)
 intern :: proc(ev: ^Event, wire_json: string) -> ^Stored {
 	s := new(Stored)
@@ -127,27 +138,18 @@ intern :: proc(ev: ^Event, wire_json: string) -> ^Stored {
 	s.json = strings.clone(wire_json)
 
 	count := 0
-	for tag in ev.tags {
-		if len(tag) >= 2 && len(tag[0]) == 1 {
-			ch := tag[0][0]
-			if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' do count += 1
-		}
-	}
+	for tag in ev.tags do if retained_tag(tag) do count += 1
 	s.tags = make([][2]string, count)
 	i := 0
 	have_d := false
 	for tag in ev.tags {
-		if len(tag) >= 2 && len(tag[0]) == 1 {
-			ch := tag[0][0]
-			if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' {
-				s.tags[i] = {strings.clone(tag[0]), strings.clone(tag[1])}
-				if tag[0] == "d" && !have_d {
-					s.d = s.tags[i][1]
-					have_d = true
-				}
-				i += 1
-			}
+		if !retained_tag(tag) do continue
+		s.tags[i] = {strings.clone(tag[0]), strings.clone(tag[1])}
+		if tag[0] == "d" && !have_d {
+			s.d = s.tags[i][1]
+			have_d = true
 		}
+		i += 1
 	}
 	s.anon = anonymous_writer(ev)
 	if s.anon do g_anon_bytes += len(s.json)
@@ -346,13 +348,48 @@ deletion_tag_matches :: proc(name, value, author: string, cutoff: i64, id, pubke
 	return ok && i64(k) == kind
 }
 
+tag_present :: proc(tags: []$T, name, value: string) -> bool {
+	for tag in tags {
+		if len(tag) >= 2 && tag[0] == name && tag[1] == value do return true
+	}
+	return false
+}
+
+// Space deletion: a kind-5 signed by `author` with ["h", T] tags covers every
+// non-kind-5 event tagged ["h", T] that `author` wrote or that consents with
+// ["owner", author]. The consent tag is signed by the event's own author, so
+// a deletion reaches nothing else. ["k", n] tags restrict the kinds; an
+// unparseable k matches no kind, so a malformed restriction never widens it.
+// No created_at cutoff: a deleted space stays deleted. Incoming events carry
+// [][]string tags and stored ones [][2]string, hence the parametric shapes.
+space_deletion_covers :: proc(deletion: []$D, author: string, target: []$T, pubkey: string, kind: i64) -> bool {
+	if kind == 5 || (pubkey != author && !tag_present(target, "owner", author)) do return false
+	in_space, restricted, kind_listed := false, false, false
+	for tag in deletion {
+		if len(tag) < 2 do continue
+		switch tag[0] {
+		case "h":
+			in_space = in_space || tag_present(target, "h", tag[1])
+		case "k":
+			restricted = true
+			k, ok := strconv.parse_int(tag[1])
+			kind_listed = kind_listed || (ok && i64(k) == kind)
+		}
+	}
+	return in_space && (!restricted || kind_listed)
+}
+
 plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: string, rejected: bool) {
 	if ev.id in g_events do return nil, "duplicate: already have this event", false
 	if ev.id in g_deleted do return nil, "blocked: event was deleted", true
 	// Hoisted out of every inner loop below: d_tag(ev) is a per-event scan.
 	ev_d := d_tag(ev)
 	for deletion in g_order {
-		if deletion.kind != 5 || deletion.pubkey != ev.pubkey do continue
+		if deletion.kind != 5 do continue
+		if space_deletion_covers(deletion.tags, deletion.pubkey, ev.tags, ev.pubkey, ev.kind) {
+			return nil, "blocked: event was deleted", true
+		}
+		if deletion.pubkey != ev.pubkey do continue
 		for tag in deletion.tags {
 			if deletion_tag_matches(tag[0], tag[1], deletion.pubkey, deletion.created_at, ev.id, ev.pubkey, ev.kind, ev_d, ev.created_at) {
 				return nil, "blocked: event was deleted", true
@@ -372,14 +409,15 @@ plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: strin
 			victim = true
 		}
 		if ev.kind == 5 {
-			// Tag count is checked in store_event; a single deletion still
-			// retires at most MAX_LIMIT events, absurd at this scale.
+			// Tag count is checked in store_event. Victims are uncapped: e/a
+			// tags name at most MAX_PLAN_TAGS live events, and a space
+			// deletion must leave no survivor. The A record logs only the
+			// kind-5; replay re-derives this same set, so one record removes
+			// a space of any size atomically.
+			if space_deletion_covers(ev.tags, ev.pubkey, s.tags, s.pubkey, s.kind) do victim = true
 			for tag, i in ev.tags {
-				if i >= MAX_PLAN_TAGS || len(victims) >= MAX_LIMIT do break
-				if len(tag) >= 2 && deletion_tag_matches(tag[0], tag[1], ev.pubkey, ev.created_at, s.id, s.pubkey, s.kind, s.d, s.created_at) {
-					victim = true
-					break
-				}
+				if victim || i >= MAX_PLAN_TAGS do break
+				if len(tag) >= 2 && deletion_tag_matches(tag[0], tag[1], ev.pubkey, ev.created_at, s.id, s.pubkey, s.kind, s.d, s.created_at) do victim = true
 			}
 		}
 		if victim do append(&victims, s)

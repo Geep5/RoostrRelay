@@ -25,7 +25,12 @@ Fly proxy (TLS)  →  plaintext :7777
   serialized under one mutex. `DB_PATH` contains an event log, not SQLite.
 - Kinds: regular stored; 0/3/1xxxx replaceable; 2xxxx ephemeral
   (broadcast only); 3xxxx addressable per (pubkey, kind, d). NIP-09
-  deletion honored for the author's own events.
+  deletion (`e`/`a` tags) honored for the author's own events.
+- Space deletion: a kind 5 signed by P with one or more `["h", T]` tags deletes
+  every stored non-kind-5 event tagged `["h", T]` that P authored or that
+  consents with `["owner", P]` (signed by its own author). `["k", "<kind>"]`
+  tags restrict the kinds. It is complete (no page cap) and retained: later
+  matching events are rejected with `blocked: event was deleted`.
 - Caps: 1 MiB inbound message/serialized event, 900 KiB content, 32 subscriptions
   per connection, 10 filters/REQ, limit ≤ 1000, and 8 MiB total query response
   budget. Filter arrays and retained filter bytes are bounded. Inbound JSON
@@ -54,6 +59,8 @@ and fails startup for operator recovery.
 Compaction preserves deleted IDs and deletion requests so removed events cannot
 be restored by republishing them. It checks file and directory sync/rename errors.
 It is boot-triggered after sufficient tombstones; canonical history has no TTL.
+A space deletion is logged as its kind-5 alone; replay re-derives the same
+victims, so one `A` record removes a space of any size.
 
 **Never roll back to the pre-`A` binary against an upgraded log:** the old reader
 would treat new records as a torn tail. Restore a matching pre-upgrade backup or

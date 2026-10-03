@@ -44,6 +44,31 @@ when ODIN_TEST {
 		}
 	}
 
+	store_test_tagged :: proc(n: int, pubkey: string, kind: i64, tags: [][]string, timestamp: i64 = 10) -> Event {
+		ev := store_test_event(n, kind, timestamp)
+		ev.pubkey = pubkey
+		ev.tags = tags
+		ev.tags_json = canon_tags(tags)
+		return ev
+	}
+
+	// Plans and applies exactly as replay does; returns the victim count.
+	store_test_apply :: proc(ev: ^Event) -> (victims: int, message: string) {
+		planned, msg, _ := plan_operation(ev)
+		if msg == "" do apply_operation(ev, event_json(ev), planned[:])
+		return len(planned), msg
+	}
+
+	// Boot path: a fresh store replaying the file at `path`.
+	store_test_replay_file :: proc(path: string) -> Record_Status {
+		data, err := os.read_entire_file_from_path(path, context.allocator)
+		if err != nil do return .Corrupt
+		defer delete(data)
+		store_test_reset()
+		_, status := replay(data)
+		return status
+	}
+
 	store_test_frame :: proc(type: u8, wire: string) -> []u8 {
 		out := make([]u8, len(wire)+9, context.temp_allocator)
 		out[0] = type
@@ -327,6 +352,161 @@ when ODIN_TEST {
 		late.created_at = 10
 		_, _, rejected = plan_operation(&late)
 		testing.expect(t, rejected)
+	}
+
+	@(test)
+	store_space_deletion_consent_and_kinds :: proc(t: ^testing.T) {
+		sync.lock(&store_test_mu)
+		defer sync.unlock(&store_test_mu)
+		store_test_reset()
+		defer store_test_cleanup()
+		owner := strings.repeat("a", 64, context.temp_allocator)
+		member := strings.repeat("b", 64, context.temp_allocator)
+		attacker := strings.repeat("c", 64, context.temp_allocator)
+		space := "blinded-space-tag"
+		other := "blinded-other-tag"
+		own := store_test_tagged(1, owner, 1078, [][]string{{"h", space}})
+		consenting := store_test_tagged(2, member, 1079, [][]string{{"h", other}, {"h", space}, {"owner", owner}})
+		plain := store_test_tagged(3, member, 1078, [][]string{{"h", space}})
+		foreign_consent := store_test_tagged(4, member, 1078, [][]string{{"h", space}, {"owner", attacker}})
+		unlisted_kind := store_test_tagged(5, owner, 1, [][]string{{"h", space}})
+		other_space := store_test_tagged(6, member, 1078, [][]string{{"h", other}, {"owner", owner}})
+		attacker_own := store_test_tagged(7, attacker, 1078, [][]string{{"h", space}})
+		for ev in ([]^Event{&own, &consenting, &plain, &foreign_consent, &unlisted_kind, &other_space, &attacker_own}) {
+			_ = intern(ev, event_json(ev))
+		}
+
+		// The owner wipes its own and consenting events of the listed kinds;
+		// another author's event without ["owner", owner] survives.
+		owner_delete := store_test_tagged(10, owner, 5, [][]string{{"h", space}, {"k", "1078"}, {"k", "1079"}}, 20)
+		victims, message := store_test_apply(&owner_delete)
+		testing.expect(t, message == "" && victims == 2)
+		testing.expect(t, !(own.id in g_events) && !(consenting.id in g_events) && own.id in g_deleted && consenting.id in g_deleted)
+		testing.expect(t, plain.id in g_events && foreign_consent.id in g_events && unlisted_kind.id in g_events)
+		testing.expect(t, other_space.id in g_events && attacker_own.id in g_events)
+
+		// Retained: matching late arrivals are refused, including another
+		// author's consenting event; unlisted kinds and non-consenting
+		// authors still pass, as does the same author in another space.
+		rejected: bool
+		late := store_test_tagged(11, owner, 1079, [][]string{{"h", space}}, 30)
+		_, message, rejected = plan_operation(&late)
+		testing.expect(t, rejected && message == "blocked: event was deleted")
+		late = store_test_tagged(12, member, 1078, [][]string{{"owner", owner}, {"h", space}}, 30)
+		_, message, rejected = plan_operation(&late)
+		testing.expect(t, rejected && message == "blocked: event was deleted")
+		late = store_test_tagged(13, owner, 1, [][]string{{"h", space}}, 30)
+		_, message, rejected = plan_operation(&late)
+		testing.expect(t, !rejected && message == "")
+		late = store_test_tagged(14, member, 1078, [][]string{{"h", space}}, 30)
+		_, message, rejected = plan_operation(&late)
+		testing.expect(t, !rejected && message == "")
+		late = store_test_tagged(15, owner, 1078, [][]string{{"h", other}}, 30)
+		_, message, rejected = plan_operation(&late)
+		testing.expect(t, !rejected && message == "")
+
+		// Any other signer reaches only its own events and those consenting to
+		// it. Its e tag naming someone else's event stays author-only NIP-09.
+		attacker_delete := store_test_tagged(16, attacker, 5, [][]string{{"h", space}, {"e", plain.id}}, 40)
+		victims, message = store_test_apply(&attacker_delete)
+		testing.expect(t, message == "" && victims == 2)
+		testing.expect(t, !(attacker_own.id in g_events) && !(foreign_consent.id in g_events))
+		testing.expect(t, plain.id in g_events && unlisted_kind.id in g_events && owner_delete.id in g_events)
+
+		// Without k tags every kind goes except deletion requests; another
+		// space stays untouched even when it consents to the owner.
+		owner_wipe := store_test_tagged(17, owner, 5, [][]string{{"h", space}}, 50)
+		victims, message = store_test_apply(&owner_wipe)
+		testing.expect(t, message == "" && victims == 1 && !(unlisted_kind.id in g_events))
+		testing.expect(t, owner_delete.id in g_events && attacker_delete.id in g_events)
+		testing.expect(t, plain.id in g_events && other_space.id in g_events)
+		late = store_test_tagged(18, owner, 1, [][]string{{"h", space}}, 60)
+		_, message, rejected = plan_operation(&late)
+		testing.expect(t, rejected && message == "blocked: event was deleted")
+	}
+
+	store_test_expect_space_gone :: proc(t: ^testing.T, count, kept: int, late: ^Event) {
+		gone, present := 0, 0
+		for i in 1..=count {
+			id := fmt.tprintf("%064x", i)
+			if !(id in g_events) && id in g_deleted do gone += 1
+		}
+		for i in count+1..=count+kept {
+			if fmt.tprintf("%064x", i) in g_events do present += 1
+		}
+		testing.expect_value(t, gone, count)
+		testing.expect_value(t, present, kept)
+		testing.expect_value(t, len(g_order), kept)
+		_, message, rejected := plan_operation(late)
+		testing.expect(t, rejected && message == "blocked: event was deleted")
+	}
+
+	@(test)
+	store_space_deletion_complete_across_replay_and_compaction :: proc(t: ^testing.T) {
+		sync.lock(&store_test_mu)
+		defer sync.unlock(&store_test_mu)
+		store_test_reset()
+		defer store_test_cleanup()
+		old_dynamic := g_dynamic
+		g_dynamic = nil
+		defer {
+			for k in g_dynamic do delete(k)
+			delete(g_dynamic)
+			g_dynamic = old_dynamic
+		}
+		owner := strings.repeat("a", 64, context.temp_allocator)
+		member := strings.repeat("b", 64, context.temp_allocator)
+		space := "blinded-space-tag"
+		own_tags := [][]string{{"h", space}}
+		consent_tags := [][]string{{"h", space}, {"owner", owner}}
+		// Several MAX_LIMIT pages of owner and consenting member events, then
+		// member events that never consented.
+		count := 2*MAX_LIMIT + 7
+		survivors := 3
+		log := make([dynamic]u8, context.temp_allocator)
+		for i in 0..<count+survivors {
+			ev: Event
+			switch {
+			case i >= count: ev = store_test_tagged(i+1, member, 1078, own_tags)
+			case i%2 == 0:   ev = store_test_tagged(i+1, owner, 1078, own_tags)
+			case:            ev = store_test_tagged(i+1, member, 1079, consent_tags)
+			}
+			append(&log, ..store_test_frame('A', event_json(&ev)))
+		}
+		fd, err := os.create_temp_file("", "relay-space-*")
+		if !testing.expect(t, err == nil) do return
+		path := strings.clone(os.name(fd))
+		defer delete(path)
+		defer os.remove(path)
+		testing.expect(t, write_full(fd, log[:]) && os.sync(fd) == nil)
+		os.close(fd)
+		g_log_path = path
+		defer g_log_path = ""
+		testing.expect_value(t, store_test_replay_file(path), Record_Status.Complete)
+		testing.expect_value(t, len(g_order), count+survivors)
+
+		// One accepted deletion, logged as one A record, empties the space.
+		fd, err = os.open(path, {.Write, .Append}, os.Permissions_Default_File)
+		if !testing.expect(t, err == nil) do return
+		g_fd = fd
+		del := store_test_tagged(count+survivors+1, owner, 5, [][]string{{"h", space}, {"k", "1078"}, {"k", "1079"}}, 20)
+		ok, message := store_event(&del)
+		os.close(fd)
+		g_fd = nil
+		testing.expect(t, ok && message == "")
+		late := store_test_tagged(count+survivors+2, member, 1079, consent_tags, 30)
+		store_test_expect_space_gone(t, count, survivors+1, &late)
+
+		// Boot replay re-derives the same victims from that record and would
+		// compact; the compacted log keeps the deletion and its retention.
+		testing.expect_value(t, store_test_replay_file(path), Record_Status.Complete)
+		store_test_expect_space_gone(t, count, survivors+1, &late)
+		testing.expect(t, g_tombs >= COMPACT_MIN_TOMBS && compact())
+		testing.expect_value(t, store_test_replay_file(path), Record_Status.Complete)
+		store_test_expect_space_gone(t, count, survivors+1, &late)
+		resurrect := store_test_tagged(1, owner, 1078, own_tags)
+		_, message, _ = plan_operation(&resurrect)
+		testing.expect_value(t, message, "blocked: event was deleted")
 	}
 
 	@(test)
