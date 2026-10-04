@@ -30,7 +30,7 @@ nip11_doc :: proc() -> []byte {
 		canon_escape(&sb, contact)
 	}
 	fmt.sbprintf(&sb,
-		`,"supported_nips":[1,9,11],"software":"https://github.com/Geep5/RoostrRelay","version":"0.1.0",`+
+		`,"supported_nips":[1,9,11,77],"software":"https://github.com/Geep5/RoostrRelay","version":"0.1.0",`+
 		`"limitation":{{"max_message_length":%d,"max_subscriptions":%d,"max_filters":%d,"max_limit":%d,`+
 		`"auth_required":false,"payment_required":false,"restricted_writes":%v}}}}`,
 		MAX_MESSAGE, MAX_SUBS_PER_CONN, MAX_FILTERS_PER_REQ, MAX_LIMIT, len(g_allowed) > 0)

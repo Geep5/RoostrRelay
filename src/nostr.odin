@@ -394,6 +394,35 @@ handle_message :: proc(c: ^Conn, raw: string) {
 		sub_id, sok := jstr(arr[1])
 		if !sok do return
 		remove_subscription(c, sub_id)
+	case "NEG-OPEN":
+		if len(arr) < 4 {
+			send_notice(c, "invalid: NEG-OPEN needs sub id, filter and message")
+			return
+		}
+		sub_id, sok := jstr(arr[1])
+		message, mok := jstr(arr[3])
+		if !sok || len(sub_id) == 0 || len(sub_id) > 64 || !mok {
+			send_notice(c, "invalid: bad NEG-OPEN")
+			return
+		}
+		handle_neg_open(c, sub_id, arr[2], message)
+	case "NEG-MSG":
+		if len(arr) < 3 {
+			send_notice(c, "invalid: NEG-MSG needs sub id and message")
+			return
+		}
+		sub_id, sok := jstr(arr[1])
+		message, mok := jstr(arr[2])
+		if !sok || len(sub_id) == 0 || len(sub_id) > 64 || !mok {
+			send_notice(c, "invalid: bad NEG-MSG")
+			return
+		}
+		handle_neg_msg(c, sub_id, message)
+	case "NEG-CLOSE":
+		if len(arr) < 2 do return
+		sub_id, sok := jstr(arr[1])
+		if !sok do return
+		neg_close(c, sub_id)
 	case:
 		send_notice(c, fmt.tprintf("invalid: unknown message type %s", verb))
 	}

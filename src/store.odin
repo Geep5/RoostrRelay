@@ -640,6 +640,38 @@ query_filter :: proc(f: ^Filter, byte_budget := MAX_QUERY_BYTES) -> (rows: []Sto
 	return rows, exhausted
 }
 
+// NIP-77 item set: every stored event matching f, ignoring limit and the
+// response byte budget (only ids are kept). Deleted and superseded events
+// are never in g_order, so deletions apply exactly as in query_filter.
+// Negentropy timestamps are unsigned: negative created_at cannot be ranged
+// and is left out. ok=false once more than max_items match. The caller owns
+// items (context.allocator).
+neg_collect :: proc(f: ^Filter, max_items: int) -> (items: []Neg_Item, ok: bool) {
+	out := make([dynamic]Neg_Item)
+	{
+		sync.lock(&g_mu)
+		defer sync.unlock(&g_mu)
+		for s in g_order {
+			if s.created_at < 0 || !matches(s, f) do continue
+			if len(out) == max_items {
+				delete(out)
+				return nil, false
+			}
+			item := Neg_Item{timestamp = u64(s.created_at)}
+			for i in 0 ..< NEG_ID_SIZE do item.id[i] = hex_nibble(s.id[2*i]) << 4 | hex_nibble(s.id[2*i+1])
+			append(&out, item)
+		}
+	}
+	slice.sort_by(out[:], neg_item_less)
+	return out[:], true
+}
+
+// Stored ids are validated lowercase hex (is_hex64).
+@(private = "file")
+hex_nibble :: proc(c: u8) -> u8 {
+	return c - '0' if c <= '9' else c - 'a' + 10
+}
+
 // -- Dynamic allowlist (kind 30100 "roostr-allowlist") ----------------
 //
 // Resident (env-allowlisted) keys administer extra writer pubkeys by

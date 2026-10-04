@@ -13,7 +13,7 @@ Live at `wss://roostr-relay.fly.dev`.
 Fly proxy (TLS)  →  plaintext :7777
   ├── HTTP: NIP-11 on GET /  (Accept: application/nostr+json), /health
   └── WebSocket (RFC 6455, hand-rolled)
-        ├── NIP-01 dispatch: EVENT / REQ / CLOSE
+        ├── NIP-01 dispatch: EVENT / REQ / CLOSE; NIP-77 NEG-OPEN / NEG-MSG / NEG-CLOSE
         ├── canonical ID serializer (hand-rolled; core JSON parses only)
         ├── BIP-340 Schnorr verify (pure Odin; optional libsecp256k1 cross-check)
         ├── in-memory subscription registry, live matching
@@ -43,6 +43,32 @@ Fly proxy (TLS)  →  plaintext :7777
   ping loop pongs keep any healthy subscriber well clear of it.
 - Control frames require FIN and ≤125 bytes, and per-frame scratch memory is
   reclaimed even for control-only traffic. Fragment counts and bytes are bounded.
+
+## NIP-77 (negentropy sync)
+
+`NEG-OPEN` / `NEG-MSG` / `NEG-CLOSE` speak [Negentropy](https://github.com/hoytech/negentropy)
+protocol V1 as the responder (`supported_nips` lists 77). The item set for
+`NEG-OPEN` is every stored event matching its single filter - `limit` and the
+8 MiB query budget do not apply, since only `(created_at, id)` pairs are kept -
+with deletions and replacements honored exactly as `REQ` sees them. Events with
+a negative `created_at` cannot be ranged and are left out. The set is
+snapshotted at `NEG-OPEN`, so every round of one session reconciles against
+the same set; fetch the needed ids afterwards with `REQ {"ids": [...]}`.
+
+- Caps: 8 sessions per connection and 500,000 items per session
+  (`NEG-ERR "blocked: ..."` beyond either). Responses are limited to 250,000
+  bytes (500,000 hex characters); larger differences take more rounds.
+- `NEG-MSG` for an unknown or closed id gets `NEG-ERR "closed: ..."`; a
+  malformed filter or message gets `NEG-ERR "invalid: ..."` and closes that
+  session. Reopening an id replaces its session. A newer protocol version is
+  answered with `61` so the client can downgrade.
+- Sessions are freed by `NEG-CLOSE`, `NEG-ERR` or the connection closing.
+- Session ids are a separate namespace from `REQ` subscriptions and do not
+  count against the 32-subscription cap.
+
+`odin test src` checks varint, fingerprint and bound encodings and full
+responses byte-for-byte against vectors from the hoytech JS reference, and
+drives the responder to convergence under frame limits.
 
 ## Storage upgrades and recovery
 

@@ -45,6 +45,7 @@ Sub :: struct {
 Conn :: struct {
 	sock:      net.TCP_Socket,
 	subs:      map[string]Sub, // protected by g_conns_mu while registered
+	negs:      map[string]Neg_Session, // NIP-77 sessions; reader thread only
 	allocator: mem.Allocator, // owns queued bytes, independent of producer scratch
 	sender:    ^thread.Thread,
 	send_mu:   sync.Mutex, // protects queue, stopping, closing and last_pong
@@ -410,10 +411,12 @@ ws_serve :: proc(sock: net.TCP_Socket) {
 	c.sock = sock
 	c.allocator = context.allocator
 	c.subs = make(map[string]Sub)
+	c.negs = make(map[string]Neg_Session)
 	c.last_pong = unix_now()
 	c.sender = thread.create_and_start_with_poly_data(c, ws_sender)
 	if c.sender == nil {
 		delete(c.subs)
+		delete(c.negs)
 		net.close(sock)
 		free(c)
 		return
@@ -458,6 +461,7 @@ conn_teardown :: proc(c: ^Conn, flush_close: bool) {
 	ws_queue_discard(c)
 	for _, &sub in c.subs do mem.dynamic_arena_destroy(&sub.arena)
 	delete(c.subs)
+	neg_close_all(c)
 	net.close(c.sock)
 	free(c)
 }
