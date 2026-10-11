@@ -37,6 +37,6 @@ primary_region = "sjc"
     port = 443
 
 [[vm]]
-  memory = "1gb"
+  memory = "2gb"
   cpu_kind = "shared"
   cpus = 1

@@ -7,7 +7,8 @@ package relay
 // plus payload; legacy E/T checksum only payload, exactly as before.
 // An incomplete EOF tail is always truncated at boot (bytes past a torn
 // append are untrustworthy, even if a suffix decodes as a valid frame);
-// corrupt complete records are never discarded.
+// corrupt complete records are never discarded. Boot streams the log through
+// a fixed window (REPLAY_BUFFER), never holding the whole file in memory.
 // g_mu owns the file, append-failure latch and all in-memory indexes.
 
 import "core:encoding/json"
@@ -45,6 +46,8 @@ g_deletions: [dynamic]^Stored // retained kind-5 requests, the only events that 
 g_deletion_refs: map[string]int // author+id of each retained ["e", id] -> request count
 g_tombs: int // tombstoned records currently wasting log bytes
 g_anon_bytes: int // retained wire bytes from anonymous (non-allowlisted) writers
+g_log_bytes: int // current log file size
+g_live_bytes: int // size compaction would write: live E records + retained T records
 
 // Stranger retention quotas. The per-event size fence lives in nostr.odin
 // (ANON_MAX_EVENT_BYTES); these bound the aggregate: kind-0 rotation across
@@ -56,6 +59,14 @@ ANON_MAX_GIFTS_PER_TARGET :: 64
 
 MAX_RECORD :: MAX_MESSAGE // same bound for acceptance, new writes and legacy replay
 COMPACT_MIN_TOMBS :: 1024
+// Online compaction: once the log is more than twice what compaction would
+// write AND at least this many bytes are dead, the next commit rewrites it.
+COMPACT_MIN_DEAD_BYTES :: 64 << 20
+RECORD_OVERHEAD :: 9 // [type][length:u32][...][crc32]
+// Boot replay window. Every complete record fits, so a record still
+// incomplete after a refill is a genuine EOF tear, exactly as in a whole-file read.
+REPLAY_BUFFER :: 4 << 20
+#assert(REPLAY_BUFFER >= MAX_RECORD + RECORD_OVERHEAD)
 // Tags of one event examined by plan_operation. A kind-5 over this bound is
 // REJECTED rather than partially applied: a silently truncated deletion
 // leaves the client believing the relay dropped events it still serves.
@@ -111,11 +122,15 @@ append_operation :: proc(wire: string) -> bool {
 		g_append_failed = true
 		return false
 	}
+	g_log_bytes += len(wire) + RECORD_OVERHEAD
 	return true
 }
 
 remember_deleted :: proc(id: string) {
-	if !(id in g_deleted) do g_deleted[strings.clone(id)] = true
+	if !(id in g_deleted) {
+		g_deleted[strings.clone(id)] = true
+		g_live_bytes += len(id) + RECORD_OVERHEAD
+	}
 }
 
 // -- In-memory index ---------------------------------------------------
@@ -157,6 +172,7 @@ intern :: proc(ev: ^Event, wire_json: string) -> ^Stored {
 	s.anon = anonymous_writer(ev)
 	s.space_deletion = is_space_deletion(ev)
 	if s.anon do g_anon_bytes += len(s.json)
+	g_live_bytes += len(s.json) + RECORD_OVERHEAD
 
 	s.idx = len(g_order)
 	append(&g_order, s)
@@ -209,6 +225,7 @@ evict :: proc(s: ^Stored) {
 	delete_key(&g_events, s.id)
 
 	if s.anon do g_anon_bytes -= len(s.json)
+	g_live_bytes -= len(s.json) + RECORD_OVERHEAD
 	delete(s.id)
 	delete(s.pubkey)
 	for t in s.tags {
@@ -228,30 +245,40 @@ store_open :: proc(path: string) {
 	g_events = make(map[string]^Stored)
 	g_deleted = make(map[string]bool)
 	g_append_failed = false
-	data, rerr := os.read_entire_file_from_path(path, context.allocator)
-	if rerr == nil {
-		defer delete(data)
-		good, status := replay(data)
+	g_live_bytes = 0
+	g_log_bytes = 0
+	fd, oerr := os.open(path, {.Read})
+	if oerr == nil {
+		good, torn, status, rerr := replay_file(fd)
+		if rerr != nil {
+			fmt.eprintln("[relay] FATAL: cannot read log:", rerr)
+			os.exit(1)
+		}
 		if status == .Corrupt {
 			fmt.eprintfln("[relay] FATAL: corrupt log at offset %d; original file untouched", good)
 			os.exit(1)
 		}
 		if status == .Incomplete {
-			fmt.printfln("[relay] store: truncating %d torn tail byte(s) at offset %d", len(data)-good, good)
-			if !replace_log(data[:good], false) {
+			fmt.printfln("[relay] store: truncating %d torn tail byte(s) at offset %d", torn, good)
+			if !truncate_log(fd, good) {
 				fmt.eprintln("[relay] FATAL: cannot durably recover incomplete log tail")
 				os.exit(1)
 			}
 		}
-	} else if rerr != os.Error(os.General_Error.Not_Exist) {
-		fmt.eprintln("[relay] FATAL: cannot read log:", rerr)
+		g_log_bytes = good
+		_ = os.close(fd)
+	} else if oerr != os.Error(os.General_Error.Not_Exist) {
+		fmt.eprintln("[relay] FATAL: cannot read log:", oerr)
 		os.exit(1)
 	}
-	if g_tombs >= COMPACT_MIN_TOMBS && !compact() {
+	if (g_tombs >= COMPACT_MIN_TOMBS || compaction_due()) && !compact() {
 		fmt.eprintln("[relay] FATAL: compaction failed; refusing to append")
 		os.exit(1)
 	}
-	reopen_for_append()
+	if !reopen_for_append() {
+		fmt.eprintln("[relay] FATAL: no appendable log")
+		os.exit(1)
+	}
 	fmt.printfln("[relay] store: %d live events, %d retained deleted IDs", len(g_order), len(g_deleted))
 }
 
@@ -274,15 +301,62 @@ decode_record :: proc(data: []u8) -> (type: u8, payload: []u8, size: int, status
 	return type, payload, size, .Complete
 }
 
+// Replay input: the whole log in buf (fd == nil), or a window buf[lo:hi]
+// over fd that refill slides forward.
+Log_Source :: struct {
+	fd:     ^os.File,
+	buf:    []u8,
+	lo, hi: int,
+	eof:    bool,
+	err:    os.Error,
+}
+
+// Moves the unconsumed bytes to the front, then reads until buf is full or
+// fd is exhausted. A read error stops replay without judging the tail.
+refill :: proc(src: ^Log_Source) -> bool {
+	src.hi = copy(src.buf, src.buf[src.lo:src.hi])
+	src.lo = 0
+	for src.hi < len(src.buf) {
+		n, err := os.read(src.fd, src.buf[src.hi:])
+		src.hi += max(n, 0)
+		if err == .EOF || (err == nil && n <= 0) { src.eof = true; break }
+		if err != nil { src.err = err; return false }
+	}
+	return true
+}
+
 replay :: proc(data: []u8) -> (good: int, status: Record_Status) {
+	src := Log_Source{buf = data, hi = len(data), eof = true}
+	return replay_source(&src)
+}
+
+// Boot path: streams the log at fd through a REPLAY_BUFFER window, with the
+// same records, offsets and status as replay over the whole file. torn is the
+// byte count past good when status is .Incomplete. A non-nil err means a read
+// failed and status says nothing about the file.
+replay_file :: proc(fd: ^os.File) -> (good, torn: int, status: Record_Status, err: os.Error) {
+	src := Log_Source{fd = fd, buf = make([]u8, REPLAY_BUFFER)}
+	defer delete(src.buf)
+	good, status = replay_source(&src)
+	return good, src.hi - src.lo, status, src.err
+}
+
+replay_source :: proc(src: ^Log_Source) -> (good: int, status: Record_Status) {
 	// Reclaim parse trees after each record, not after the entire log.
 	arena: mem.Dynamic_Arena
 	mem.dynamic_arena_init(&arena)
 	defer mem.dynamic_arena_destroy(&arena)
 	context.temp_allocator = mem.dynamic_arena_allocator(&arena)
-	for good < len(data) {
-		type, payload, size, record_status := decode_record(data[good:])
+	for {
+		type, payload, size, record_status := decode_record(src.buf[src.lo:src.hi])
 		if record_status == .Incomplete {
+			if !src.eof {
+				// The window may end mid-record: slide it. Payloads are
+				// cloned by intern, so nothing references the moved bytes.
+				if !refill(src) do return good, .Incomplete
+				continue
+			}
+			if src.lo == src.hi do break
 			// A torn tail is ALWAYS truncated, no rescan: bytes after an
 			// interrupted append are untrustworthy, even when some suffix of
 			// them happens to decode as a complete CRC-valid frame. Only
@@ -308,6 +382,7 @@ replay :: proc(data: []u8) -> (good: int, status: Record_Status) {
 			}
 		}
 		good += size
+		src.lo += size
 		free_all(context.temp_allocator)
 	}
 	return good, .Complete
@@ -322,10 +397,26 @@ sync_log_directory :: proc() -> bool {
 
 // Only a fully written, synced and closed temporary file may replace the log.
 // A post-rename directory-sync error is fatal too: no appends may follow it.
+@(private = "file")
+begin_replacement :: proc() -> (fd: ^os.File, tmp: string, ok: bool) {
+	tmp = fmt.tprintf("%s.tmp", g_log_path)
+	err: os.Error
+	fd, err = os.open(tmp, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
+	return fd, tmp, err == nil
+}
+
+@(private = "file")
+commit_replacement :: proc(fd: ^os.File, tmp: string, written: bool) -> bool {
+	ok := written && os.sync(fd) == nil
+	if os.close(fd) != nil do ok = false
+	if !ok { _ = os.remove(tmp); return false }
+	if os.rename(tmp, g_log_path) != nil { _ = os.remove(tmp); return false }
+	return sync_log_directory()
+}
+
 replace_log :: proc(prefix: []u8, compacting: bool) -> bool {
-	tmp := fmt.tprintf("%s.tmp", g_log_path)
-	fd, err := os.open(tmp, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
-	if err != nil do return false
+	fd, tmp, opened := begin_replacement()
+	if !opened do return false
 	ok := true
 	if compacting {
 		for id in g_deleted {
@@ -339,30 +430,74 @@ replace_log :: proc(prefix: []u8, compacting: bool) -> bool {
 	} else {
 		ok = write_full(fd, prefix)
 	}
-	if ok do ok = os.sync(fd) == nil
-	if os.close(fd) != nil do ok = false
-	if !ok { _ = os.remove(tmp); return false }
-	if os.rename(tmp, g_log_path) != nil { _ = os.remove(tmp); return false }
-	return sync_log_directory()
+	return commit_replacement(fd, tmp, ok)
 }
 
-reopen_for_append :: proc() {
+// Heals a torn tail without loading the log: the trusted prefix [0, good)
+// of src streams into the replacement, committed exactly like replace_log.
+truncate_log :: proc(src: ^os.File, good: int) -> bool {
+	fd, tmp, opened := begin_replacement()
+	if !opened do return false
+	buf := make([]u8, REPLAY_BUFFER)
+	defer delete(buf)
+	ok := true
+	off := 0
+	for ok && off < good {
+		n, err := os.read_at(src, buf[:min(len(buf), good-off)], i64(off))
+		if err != nil || n <= 0 { ok = false; break }
+		ok = write_full(fd, buf[:n])
+		off += n
+	}
+	return commit_replacement(fd, tmp, ok)
+}
+
+// Opens g_log_path for appends and records its size. On failure g_fd stays
+// untouched and the caller decides: boot exits, online compaction latches.
+reopen_for_append :: proc() -> bool {
 	fd, err := os.open(g_log_path, {.Write, .Create, .Append}, os.Permissions_Default_File)
 	if err != nil {
-		fmt.eprintln("[relay] FATAL: cannot open log for append:", err)
-		os.exit(1)
+		fmt.eprintln("[relay] store: cannot open log for append:", err)
+		return false
+	}
+	size, size_err := os.file_size(fd)
+	if size_err != nil || os.sync(fd) != nil || !sync_log_directory() {
+		fmt.eprintln("[relay] store: cannot size and sync log and directory")
+		_ = os.close(fd)
+		return false
 	}
 	g_fd = fd
-	if os.sync(fd) != nil || !sync_log_directory() {
-		fmt.eprintln("[relay] FATAL: cannot sync log and directory")
-		os.exit(1)
-	}
+	g_log_bytes = int(size)
+	return true
 }
 
 compact :: proc() -> bool {
 	if !replace_log(nil, true) do return false
 	g_tombs = 0
 	return true
+}
+
+// Dead bytes dominate: the log is over twice what compaction would write and
+// at least COMPACT_MIN_DEAD_BYTES of it is superseded, deleted or rejected.
+compaction_due :: proc() -> bool {
+	return g_log_bytes - g_live_bytes >= COMPACT_MIN_DEAD_BYTES && g_log_bytes > 2*g_live_bytes
+}
+
+// Runs inside store_event with g_mu held, so no query or write sees the swap.
+// After the rename g_fd still names the replaced inode, so it is closed and
+// the new log opened. Any failure latches g_append_failed like a failed
+// append: whichever file then sits at g_log_path is a complete, synced log
+// (the old one, or the fsynced replacement), and restart replays it.
+compact_online :: proc() {
+	before := g_log_bytes
+	ok := compact()
+	_ = os.close(g_fd)
+	g_fd = nil
+	if !ok || !reopen_for_append() {
+		g_append_failed = true
+		fmt.eprintln("[relay] store: online compaction failed; writes refused until restart")
+		return
+	}
+	fmt.printfln("[relay] store: compacted log online, %d -> %d bytes", before, g_log_bytes)
 }
 
 // -- store_event -------------------------------------------------------
@@ -548,6 +683,9 @@ store_event :: proc(ev: ^Event) -> (ok: bool, message: string) {
 	if !append_operation(wire) do return false, "error: storage failure"
 	apply_operation(ev, wire, victims[:])
 	if ev.kind == 5 || ev.kind == ALLOWLIST_KIND do refresh_dynamic_allowlist_locked()
+	// The event is durable in the old log and live in memory, so it survives
+	// compaction (and its failure) either way.
+	if compaction_due() do compact_online()
 	return true, ""
 }
 

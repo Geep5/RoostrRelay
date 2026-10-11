@@ -113,11 +113,16 @@ An incomplete EOF tail is ALWAYS truncated at boot (and the truncation is
 logged): bytes past a torn append are untrustworthy, even when some suffix of
 them happens to decode as a complete CRC-valid frame. Mid-log damage - a bad
 CRC on a complete-sized record - still preserves the original file untouched
-and fails startup for operator recovery.
+and fails startup for operator recovery. Boot streams the log through a fixed
+4 MiB window, so boot memory tracks the live data, not the file size.
 
 Compaction preserves deleted IDs and deletion requests so removed events cannot
 be restored by republishing them. It checks file and directory sync/rename errors.
-It is boot-triggered after sufficient tombstones; canonical history has no TTL.
+Dead bytes dominate once the log exceeds twice the compacted size with at least
+64 MiB dead. Compaction runs at boot after sufficient tombstones or when dead
+bytes dominate, and online on the same byte rule, under the store lock that
+queries share; a failed online compaction latches writes closed until restart.
+Canonical history has no TTL.
 A space deletion is logged as its kind-5 alone; replay re-derives the same
 victims, so one `A` record removes a space of any size.
 
