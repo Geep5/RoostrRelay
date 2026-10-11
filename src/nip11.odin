@@ -32,7 +32,9 @@ nip11_doc :: proc() -> []byte {
 	fmt.sbprintf(&sb,
 		`,"supported_nips":[1,9,11,77],"software":"https://github.com/Geep5/RoostrRelay","version":"0.1.0",`+
 		`"limitation":{{"max_message_length":%d,"max_subscriptions":%d,"max_filters":%d,"max_limit":%d,`+
-		`"auth_required":false,"payment_required":false,"restricted_writes":%v}}}}`,
-		MAX_MESSAGE, MAX_SUBS_PER_CONN, MAX_FILTERS_PER_REQ, MAX_LIMIT, len(g_allowed) > 0)
+		`"auth_required":false,"payment_required":false,"restricted_writes":%v}},`+
+		`"supported_features":["blossom"],`+
+		`"blossom":{{"buds":[1,2,6,11],"max_blob_size":%d,"upload":"/upload","list":"/list/<pubkey>"}}}}`,
+		MAX_MESSAGE, MAX_SUBS_PER_CONN, MAX_FILTERS_PER_REQ, MAX_LIMIT, len(g_allowed) > 0, BLOB_MAX_SIZE)
 	return transmute([]byte)strings.to_string(sb)
 }

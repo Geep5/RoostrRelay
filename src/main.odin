@@ -4,15 +4,17 @@ package relay
 //
 // One process, one reader and one joined sender per WebSocket (blocking
 // core:net). TLS terminates at the Fly proxy; we
-// listen on plaintext PORT. Storage is SQLite on a local file; writes
-// are serialized under g_db_mu, WAL keeps readers unblocked.
+// listen on plaintext PORT. Storage is an append-only event log
+// (store.odin) serialized under g_mu; Blossom blobs live beside it in
+// <dir of DB_PATH>/blobs (blossom.odin).
 //
 // Config (env):
 //   PORT                    listen port          (default 7777)
-//   DB_PATH                 sqlite file          (default ./relay.db)
+//   DB_PATH                 event log file       (default ./relay.db)
 //   RELAY_ALLOWED_PUBKEYS   comma-separated hex; empty = open writes
 //   RELAY_NAME / RELAY_DESCRIPTION / RELAY_PUBKEY / RELAY_CONTACT
 //                           NIP-11 fields
+//   BLOSSOM_PUBLIC_URL      base for blob descriptor urls (default from Host)
 
 import "core:fmt"
 import "core:net"
@@ -46,6 +48,7 @@ main :: proc() {
 
 	verify_init()
 	store_open(db_path)
+	blob_open(db_path)
 	refresh_dynamic_allowlist()
 
 	endpoint := net.Endpoint{address = net.IP4_Address{0, 0, 0, 0}, port = port}
@@ -75,12 +78,13 @@ main :: proc() {
 	}
 }
 
-// -- HTTP entry: upgrade to WebSocket or answer NIP-11 ----------------
+// -- HTTP entry: upgrade to WebSocket, Blossom, or NIP-11 --------------
 
 Request :: struct {
 	method:  string,
 	path:    string,
 	headers: map[string]string, // lowercased keys
+	rest:    []byte, // bytes received past the header (start of the body)
 }
 
 handle_connection :: proc(sock: net.TCP_Socket) {
@@ -112,6 +116,11 @@ handle_connection :: proc(sock: net.TCP_Socket) {
 		return
 	}
 
+	if blossom_route(sock, &req) {
+		net.close(sock)
+		return
+	}
+
 	switch {
 	case req.method == "GET" && req.path == "/health":
 		respond(sock, "200 OK", "text/plain", transmute([]byte)string("ok"))
@@ -138,8 +147,8 @@ read_head :: proc(sock: net.TCP_Socket) -> (Request, bool) {
 		n, rerr := net.recv_tcp(sock, chunk[:])
 		if rerr != nil || n <= 0 do return {}, false
 		append(&buf, ..chunk[:n])
-		if len(buf) > 32768 do return {}, false
 		header_end = strings.index(string(buf[:]), "\r\n\r\n")
+		if header_end < 0 && len(buf) > 32768 do return {}, false
 	}
 
 	head := string(buf[:header_end])
@@ -153,6 +162,7 @@ read_head :: proc(sock: net.TCP_Socket) -> (Request, bool) {
 	req.method = first[0]
 	req.path = first[1]
 	req.headers = make(map[string]string, context.temp_allocator)
+	req.rest = buf[header_end+4:]
 	for line in lines[1:] {
 		colon := strings.index(line, ":")
 		if colon < 0 do continue
@@ -163,7 +173,12 @@ read_head :: proc(sock: net.TCP_Socket) -> (Request, bool) {
 	return req, true
 }
 
-CORS :: "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\n"
+// Browsers send Authorization only when it is listed by name ("*" excludes it).
+CORS :: "Access-Control-Allow-Origin: *\r\n" +
+	"Access-Control-Allow-Headers: Authorization, Content-Type, Range, X-SHA-256, X-Content-Length, X-Content-Type, *\r\n" +
+	"Access-Control-Allow-Methods: GET, HEAD, PUT, DELETE, OPTIONS\r\n" +
+	"Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, ETag, X-Reason\r\n" +
+	"Access-Control-Max-Age: 86400\r\n"
 
 respond :: proc(sock: net.TCP_Socket, status: string, content_type: string, body: []byte) {
 	head := fmt.tprintf(

@@ -12,6 +12,7 @@ Live at `wss://roostr-relay.fly.dev`.
 ```
 Fly proxy (TLS)  →  plaintext :7777
   ├── HTTP: NIP-11 on GET /  (Accept: application/nostr+json), /health
+  ├── HTTP: Blossom blobs (BUD-01/02/06/11)  →  /data/blobs/<sha256>
   └── WebSocket (RFC 6455, hand-rolled)
         ├── NIP-01 dispatch: EVENT / REQ / CLOSE; NIP-77 NEG-OPEN / NEG-MSG / NEG-CLOSE
         ├── canonical ID serializer (hand-rolled; core JSON parses only)
@@ -25,7 +26,10 @@ Fly proxy (TLS)  →  plaintext :7777
   serialized under one mutex. `DB_PATH` contains an event log, not SQLite.
 - Kinds: regular stored; 0/3/1xxxx replaceable; 2xxxx ephemeral
   (broadcast only); 3xxxx addressable per (pubkey, kind, d). NIP-09
-  deletion (`e`/`a` tags) honored for the author's own events.
+  deletion (`e`/`a` tags) honored for the author's own events. Every
+  single-letter tag is filterable (`#b`, `#c`, `#d`, `#h`, ...), in `REQ` and
+  NIP-77 alike - Roostr state sync uses addressable 31078 bases, regular 1080
+  base parts (`#c`) and 1078 deltas (`#b`).
 - Space deletion: a kind 5 signed by P with one or more `["h", T]` tags deletes
   every stored non-kind-5 event tagged `["h", T]` that P authored or that
   consents with `["owner", P]` (signed by its own author). `["k", "<kind>"]`
@@ -70,6 +74,35 @@ the same set; fetch the needed ids afterwards with `REQ {"ids": [...]}`.
 responses byte-for-byte against vectors from the hoytech JS reference, and
 drives the responder to convergence under frame limits.
 
+## Blossom (blob storage)
+
+The same port serves [Blossom](https://github.com/hzrd149/blossom) blobs;
+NIP-11 advertises it (`supported_features: ["blossom"]`, `blossom` object).
+
+| route | auth (`Authorization: Nostr <base64 kind 24242>`) |
+|---|---|
+| `GET`/`HEAD /<sha256>[.ext]` | none; one `Range: bytes=` range honored (206/416) |
+| `PUT /upload` | `t`=upload, `x`=body sha256; writer on the allowlist |
+| `HEAD /upload` | BUD-06 preflight: same checks from `X-SHA-256`/`X-Content-Length` |
+| `DELETE /<sha256>` | `t`=delete, `x`=sha256; drops the caller's upload claim |
+| `GET /list/<pubkey>` | `t`=list, signed by `<pubkey>`; that pubkey's uploads |
+
+- Auth events need a valid id and signature, `expiration` in the future and
+  `created_at` no more than 60 s ahead. Uploaders must pass the same static or
+  dynamic allowlist as event writers (all signers when the allowlist is empty).
+- Uploads need `Content-Length` (no chunked bodies), max 512 MiB (413 from the
+  header alone). The body streams in 256 KiB pieces to `blobs/.tmp-*`, hashed
+  on the fly; an `X-SHA-256` mismatch is 409, an `x` tag not covering the
+  hash 401. Committed blobs are fsynced and renamed to `blobs/<sha256>`.
+- Claims: `blobs/<sha256>.meta` holds size, type and one `pubkey uploaded`
+  line per uploader; re-uploading stored bytes adds a claim. `DELETE` drops
+  only the caller's claim (403 otherwise); the bytes go with the last one.
+  Boot removes torn temp files and metas whose blob never landed.
+- Transfers run on their connection thread and never buffer whole blobs; at
+  most 64 blob bodies stream at once (503 beyond). Descriptor URLs use
+  `X-Forwarded-Proto` + `Host`, or `BLOSSOM_PUBLIC_URL` when set.
+- CORS allows `GET, HEAD, PUT, DELETE, OPTIONS` and the `Authorization` header.
+
 ## Storage upgrades and recovery
 
 Back up the log before upgrading. The reader accepts legacy `E`/`T` records;
@@ -107,6 +140,7 @@ none are evicted. These are doorknob quotas, not a public subscription system.
 | `DB_PATH` | event log (`/data/relay.db` on Fly) |
 | `RELAY_ALLOWED_PUBKEYS` | comma-separated hex pubkeys; empty = open writes |
 | `RELAY_NAME` / `RELAY_DESCRIPTION` / `RELAY_PUBKEY` / `RELAY_CONTACT` | NIP-11 |
+| `BLOSSOM_PUBLIC_URL` | base of blob descriptor `url`s (default: from `Host`) |
 
 ## Build
 
