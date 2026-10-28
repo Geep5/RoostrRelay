@@ -11,6 +11,8 @@ import "core:thread"
 when ODIN_TEST {
 	Store_Test_Snapshot :: struct {
 		events:     map[string]string, // id -> wire JSON
+		seqs:       map[string]i64, // id -> stream seq (0 = unsequenced)
+		heads:      map[string]Stream_Cursor, // stream key -> head and oldest
 		deleted:    map[string]bool,
 		deletions:  int,
 		live_bytes: int, // exactly what compaction writes
@@ -18,10 +20,18 @@ when ODIN_TEST {
 
 	store_test_snapshot :: proc() -> (snap: Store_Test_Snapshot) {
 		snap.events = make(map[string]string, context.temp_allocator)
+		snap.seqs = make(map[string]i64, context.temp_allocator)
+		snap.heads = make(map[string]Stream_Cursor, context.temp_allocator)
 		snap.deleted = make(map[string]bool, context.temp_allocator)
 		for s in g_order {
-			snap.events[strings.clone(s.id, context.temp_allocator)] = strings.clone(s.json, context.temp_allocator)
-			snap.live_bytes += len(s.json) + RECORD_OVERHEAD
+			id := strings.clone(s.id, context.temp_allocator)
+			snap.events[id] = strings.clone(s.json, context.temp_allocator)
+			snap.seqs[id] = s.seq
+			snap.live_bytes += len(s.json) + RECORD_OVERHEAD + (s.seq > 0 ? SEQ_PREFIX : 0)
+		}
+		for key, st in g_streams {
+			snap.heads[strings.clone(key, context.temp_allocator)] = stream_cursor(st)
+			snap.live_bytes += len(key) + HEAD_PREFIX + RECORD_OVERHEAD
 		}
 		for id in g_deleted {
 			snap.deleted[strings.clone(id, context.temp_allocator)] = true
@@ -31,20 +41,24 @@ when ODIN_TEST {
 		return
 	}
 
-	store_test_expect_snapshot :: proc(t: ^testing.T, want: Store_Test_Snapshot) {
+	store_test_expect_snapshot :: proc(t: ^testing.T, want: Store_Test_Snapshot, loc := #caller_location) {
 		got := store_test_snapshot()
-		testing.expect_value(t, len(got.events), len(want.events))
-		testing.expect_value(t, len(got.deleted), len(want.deleted))
-		testing.expect_value(t, got.deletions, want.deletions)
-		testing.expect_value(t, got.live_bytes, want.live_bytes)
+		testing.expect_value(t, len(got.events), len(want.events), loc = loc)
+		testing.expect_value(t, len(got.deleted), len(want.deleted), loc = loc)
+		testing.expect_value(t, len(got.heads), len(want.heads), loc = loc)
+		testing.expect_value(t, got.deletions, want.deletions, loc = loc)
+		testing.expect_value(t, got.live_bytes, want.live_bytes, loc = loc)
 		// The incremental accounting agrees with a full recount.
-		testing.expect_value(t, g_live_bytes, got.live_bytes)
+		testing.expect_value(t, g_live_bytes, got.live_bytes, loc = loc)
 		missing := 0
 		for id, json in want.events {
-			if have, ok := got.events[id]; !ok || have != json do missing += 1
+			if have, ok := got.events[id]; !ok || have != json || got.seqs[id] != want.seqs[id] do missing += 1
+		}
+		for key, cursor in want.heads {
+			if have, ok := got.heads[key]; !ok || have != cursor do missing += 1
 		}
 		for id in want.deleted do if !(id in got.deleted) do missing += 1
-		testing.expect_value(t, missing, 0)
+		testing.expect_value(t, missing, 0, loc = loc)
 	}
 
 	store_test_temp_log :: proc(t: ^testing.T, pattern: string) -> (path: string, ok: bool) {
@@ -301,7 +315,7 @@ when ODIN_TEST {
 			if !testing.expect(t, stored) do return
 			writes += 1
 			if g_log_bytes < before {
-				compacted_from = before + len(event_json(&ev)) + RECORD_OVERHEAD
+				compacted_from = before + len(event_json(&ev)) + RECORD_OVERHEAD + SEQ_PREFIX
 				break
 			}
 		}

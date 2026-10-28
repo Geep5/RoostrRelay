@@ -16,6 +16,13 @@ when ODIN_TEST {
 	store_test_reset :: proc() {
 		for len(g_order) > 0 do evict(g_order[len(g_order)-1])
 		delete(g_order)
+		for _, st in g_streams {
+			delete(st.slots)
+			delete(st.key)
+			free(st)
+		}
+		delete(g_streams)
+		g_streams = make(map[string]^Stream)
 		delete(g_deletions)
 		delete(g_deletion_refs)
 		delete(g_events)
@@ -35,8 +42,10 @@ when ODIN_TEST {
 		store_test_reset()
 		delete(g_events)
 		delete(g_deleted)
+		delete(g_streams)
 		g_events = nil
 		g_deleted = nil
+		g_streams = nil
 	}
 
 	store_test_event :: proc(n: int, kind: i64 = 1, timestamp: i64 = 10) -> Event {
@@ -79,7 +88,7 @@ when ODIN_TEST {
 		n := u32(len(wire))
 		for i in 0..<4 do out[i+1] = u8(n >> uint(8*i))
 		copy(out[5:], transmute([]u8)wire)
-		seed := type == 'A' ? hash.crc32(out[:5]) : u32(0)
+		seed := record_crc_covers_header(type) ? hash.crc32(out[:5]) : u32(0)
 		crc := hash.crc32(transmute([]u8)wire, seed)
 		for i in 0..<4 do out[len(out)-4+i] = u8(crc >> uint(8*i))
 		return out

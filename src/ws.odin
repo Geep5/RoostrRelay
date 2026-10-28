@@ -38,8 +38,9 @@ ws_handshake :: proc(sock: net.TCP_Socket, key: string) -> bool {
 // -- Connection registry ----------------------------------------------
 
 Sub :: struct {
-	arena:   mem.Dynamic_Arena, // owns every string/slice in filters
-	filters: []Filter,
+	arena:     mem.Dynamic_Arena, // owns every string/slice in filters
+	filters:   []Filter,
+	sequenced: bool, // some filter uses `after`: EVENTs carry {"seq": n}
 }
 
 Conn :: struct {

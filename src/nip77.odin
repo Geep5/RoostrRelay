@@ -69,6 +69,10 @@ handle_neg_open :: proc(c: ^Conn, sub_id: string, filter_value: json.Value, mess
 		send_neg(c, "NEG-ERR", sub_id, "invalid: bad filter")
 		return
 	}
+	if f.has_after && f.stream == "" {
+		send_neg(c, "NEG-ERR", sub_id, "invalid: after needs one stream")
+		return
+	}
 	if len(c.negs) >= MAX_NEG_SESSIONS_PER_CONN {
 		send_neg(c, "NEG-ERR", sub_id, fmt.tprintf("blocked: at most %d negentropy sessions per connection", MAX_NEG_SESSIONS_PER_CONN))
 		return

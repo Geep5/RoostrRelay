@@ -40,6 +40,10 @@ Filter :: struct {
 	until:   i64, // 0 = unset
 	limit:   i64, // 0 = unset
 	has_limit: bool,
+	// Relay cursor: events of one stream with seq > after, ascending.
+	after:   i64,
+	has_after: bool,
+	stream:  string, // stream_key form ("s:<T>" or "p:<pubkey>"); "" = after names no single stream
 }
 
 // -- Canonical serialization ------------------------------------------
@@ -201,6 +205,9 @@ parse_filter :: proc(v: json.Value) -> (f: Filter, ok: bool) {
 		case key == "limit":
 			if f.limit, ok = jint(val); !ok || f.limit < 0 do return {}, false
 			f.has_limit = true
+		case key == "after":
+			if f.after, ok = jint(val); !ok || f.after < 0 do return {}, false
+			f.has_after = true
 		case len(key) == 2 && key[0] == '#':
 			ch := key[1]
 			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z') do return {}, false
@@ -210,6 +217,7 @@ parse_filter :: proc(v: json.Value) -> (f: Filter, ok: bool) {
 		}
 	}
 	f.tags = tag_filters[:]
+	if f.has_after do f.stream = after_stream(&f)
 	cardinality := len(f.ids) + len(f.authors) + len(f.kinds)
 	for tf in f.tags do cardinality += len(tf.values)
 	if cardinality > MAX_FILTER_CARDINALITY || filter_bytes(&f) > MAX_FILTER_BYTES do return {}, false
@@ -217,8 +225,18 @@ parse_filter :: proc(v: json.Value) -> (f: Filter, ok: bool) {
 	return f, true
 }
 
+// The one stream an `after` filter reads: its single #s value (space
+// stream), else its single author (personal stream). "" when neither names
+// exactly one; handle_req answers that with CLOSED.
+after_stream :: proc(f: ^Filter) -> string {
+	for tf in f.tags {
+		if tf.name == "s" do return len(tf.values) == 1 ? strings.concatenate({"s:", tf.values[0]}, context.temp_allocator) : ""
+	}
+	return len(f.authors) == 1 ? strings.concatenate({"p:", f.authors[0]}, context.temp_allocator) : ""
+}
+
 filter_bytes :: proc(f: ^Filter) -> int {
-	bytes := size_of(Filter) + len(f.kinds)*size_of(i64) + len(f.tags)*size_of(Tag_Filter)
+	bytes := size_of(Filter) + len(f.stream) + len(f.kinds)*size_of(i64) + len(f.tags)*size_of(Tag_Filter)
 	for s in f.ids do bytes += len(s) + size_of(string)
 	for s in f.authors do bytes += len(s) + size_of(string)
 	for tf in f.tags {
@@ -230,7 +248,10 @@ filter_bytes :: proc(f: ^Filter) -> int {
 
 // -- In-memory filter matching (live subscriptions) -------------------
 
-match_filter :: proc(f: ^Filter, ev: ^Event) -> bool {
+// seq and stream (stream_key) describe the event's place in its stream;
+// an `after` filter matches only stored events of its stream past the cursor.
+match_filter :: proc(f: ^Filter, ev: ^Event, seq: i64 = 0, stream: string = "") -> bool {
+	if f.has_after && (seq <= f.after || stream != f.stream) do return false
 	if f.since != 0 && ev.created_at < f.since do return false
 	if f.until != 0 && ev.created_at > f.until do return false
 
@@ -261,8 +282,8 @@ match_filter :: proc(f: ^Filter, ev: ^Event) -> bool {
 	return true
 }
 
-match_any :: proc(filters: []Filter, ev: ^Event) -> bool {
-	for &f in filters do if match_filter(&f, ev) do return true
+match_any :: proc(filters: []Filter, ev: ^Event, seq: i64 = 0, stream: string = "") -> bool {
+	for &f in filters do if match_filter(&f, ev, seq, stream) do return true
 	return false
 }
 
@@ -313,7 +334,9 @@ send_closed :: proc(c: ^Conn, sub_id: string, message: string) {
 	ws_send_text(c, strings.to_string(sb))
 }
 
-send_event :: proc(c: ^Conn, sub_id: string, ev_json: string) -> bool {
+// seq > 0 appends the relay cursor: ["EVENT", sub, event, {"seq": n}]. Only
+// subscriptions with an `after` filter pass it; others get plain NIP-01.
+send_event :: proc(c: ^Conn, sub_id: string, ev_json: string, seq: i64 = 0) -> bool {
 	// ws_send copies into the owned queue before returning. Reclaim this
 	// builder immediately so broadcast fanout cannot grow message scratch.
 	sb := strings.builder_make(context.allocator)
@@ -322,6 +345,7 @@ send_event :: proc(c: ^Conn, sub_id: string, ev_json: string) -> bool {
 	canon_escape(&sb, sub_id)
 	strings.write_byte(&sb, ',')
 	strings.write_string(&sb, ev_json)
+	if seq > 0 do fmt.sbprintf(&sb, `,{{"seq":%d}}`, seq)
 	strings.write_byte(&sb, ']')
 	return ws_send_text(c, strings.to_string(sb))
 }
@@ -503,8 +527,9 @@ handle_event :: proc(c: ^Conn, v: json.Value) {
 	// Kind semantics.
 	ephemeral := ev.kind >= 20000 && ev.kind < 30000
 	stored_msg := ""
+	seq: i64 = 0
 	if !ephemeral {
-		ok, msg := store_event(&ev)
+		ok, msg := store_event(&ev, &seq)
 		if !ok {
 			send_ok(c, ev.id, false, msg)
 			return
@@ -513,7 +538,7 @@ handle_event :: proc(c: ^Conn, v: json.Value) {
 	}
 
 	send_ok(c, ev.id, true, stored_msg)
-	if stored_msg == "" do broadcast(&ev)
+	if stored_msg == "" do broadcast(&ev, seq)
 }
 
 remove_subscription :: proc(c: ^Conn, sub_id: string) {
@@ -564,33 +589,65 @@ handle_req :: proc(c: ^Conn, sub_id: string, filter_values: []json.Value) {
 			send_closed(c, sub_id, "invalid: bad filter")
 			return
 		}
+		for &f in filters {
+			sub.sequenced = sub.sequenced || f.has_after
+			if f.has_after && f.stream == "" {
+				mem.dynamic_arena_destroy(&sub.arena)
+				send_closed(c, sub_id, "invalid: after needs one stream")
+				return
+			}
+		}
 		sub.filters = clone_filters(filters, sub_alloc)
 	}
 
-	// Serve stored events, newest first, deduped across filters.
+	// Serve stored events, deduped across filters: newest first, or for an
+	// `after` filter the stream's next page in ascending seq order.
+	// Subscriptions with an `after` filter see each sequenced event's seq.
+	Eose_Stream :: struct { key: string, cursor: Stream_Cursor }
+	streams := make([dynamic]Eose_Stream, context.temp_allocator)
 	seen := make(map[string]bool, context.temp_allocator)
 	remaining := MAX_QUERY_BYTES
 	for &f in sub.filters {
-		rows, exhausted := query_filter(&f, remaining)
+		cursor: Stream_Cursor
+		rows, exhausted := query_filter(&f, remaining, &cursor)
 		for row in rows {
 			remaining -= len(row.json) + QUERY_ROW_OVERHEAD
 			if row.id in seen do continue
 			seen[row.id] = true
-			if !send_event(c, sub_id, row.json) {
+			if !send_event(c, sub_id, row.json, sub.sequenced ? row.seq : 0) {
 				mem.dynamic_arena_destroy(&sub.arena)
 				return
 			}
 		}
-		if exhausted {
+		// A partial `after` page is still a correct prefix: the client pages
+		// on from its last seq. Only an empty one cannot make progress.
+		if exhausted && !(f.has_after && len(rows) > 0) {
 			mem.dynamic_arena_destroy(&sub.arena)
 			send_closed(c, sub_id, "rate-limited: query response byte budget exceeded; narrow the filter")
 			return
 		}
+		if !f.has_after do continue
+		known := false
+		for s in streams do known = known || s.key == f.stream
+		if !known do append(&streams, Eose_Stream{f.stream, cursor})
 	}
 	{
+		// Plain NIP-01 EOSE without `after`. One stream: {"head", "oldest"};
+		// several: one such object per stream, keyed by its #s value or author.
 		sb := strings.builder_make(context.temp_allocator)
 		strings.write_string(&sb, `["EOSE",`)
 		canon_escape(&sb, sub_id)
+		if len(streams) == 1 {
+			fmt.sbprintf(&sb, `,{{"head":%d,"oldest":%d}}`, streams[0].cursor.head, streams[0].cursor.oldest)
+		} else if len(streams) > 1 {
+			strings.write_string(&sb, ",{")
+			for s, i in streams {
+				if i > 0 do strings.write_byte(&sb, ',')
+				canon_escape(&sb, s.key[2:])
+				fmt.sbprintf(&sb, `:{{"head":%d,"oldest":%d}}`, s.cursor.head, s.cursor.oldest)
+			}
+			strings.write_byte(&sb, '}')
+		}
 		strings.write_byte(&sb, ']')
 		ws_send_text(c, strings.to_string(sb))
 	}
@@ -614,6 +671,7 @@ clone_filters :: proc(filters: []Filter, allocator: mem.Allocator) -> []Filter {
 		nf := f
 		nf.ids = clone_strs(f.ids, allocator)
 		nf.authors = clone_strs(f.authors, allocator)
+		nf.stream = strings.clone(f.stream, allocator)
 		nf.kinds = make([]i64, len(f.kinds), allocator)
 		copy(nf.kinds, f.kinds)
 		nf.tags = make([]Tag_Filter, len(f.tags), allocator)
@@ -625,9 +683,13 @@ clone_filters :: proc(filters: []Filter, allocator: mem.Allocator) -> []Filter {
 	return out
 }
 
-// Push a freshly accepted event to every matching open subscription.
-broadcast :: proc(ev: ^Event) {
+// Push a freshly accepted event to every matching open subscription. seq is
+// its stream seq (0 for ephemeral and unsequenced events): `after` filters
+// match only sequenced events of their stream, and subscriptions holding one
+// receive the seq with the event.
+broadcast :: proc(ev: ^Event, seq: i64 = 0) {
 	ev_js := event_json(ev)
+	stream := seq > 0 ? stream_key(ev) : ""
 	sync.lock(&g_conns_mu)
 	defer sync.unlock(&g_conns_mu)
 	when #config(RELAY_TRACE, false) {
@@ -635,7 +697,7 @@ broadcast :: proc(ev: ^Event) {
 	}
 	for c in g_conns {
 		for sub_id, &sub in c.subs {
-			matched := match_any(sub.filters, ev)
+			matched := match_any(sub.filters, ev, seq, stream)
 			when #config(RELAY_TRACE, false) {
 				fmt.eprintfln("[trace] sub %s filters=%d matched=%v", sub_id, len(sub.filters), matched)
 				for f in sub.filters {
@@ -643,7 +705,7 @@ broadcast :: proc(ev: ^Event) {
 				}
 			}
 			if matched {
-				send_event(c, sub_id, ev_js)
+				send_event(c, sub_id, ev_js, sub.sequenced ? seq : 0)
 			}
 		}
 	}

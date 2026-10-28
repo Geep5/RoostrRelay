@@ -1,10 +1,13 @@
 package relay
 
 // Durable append-only log. Legacy E (event) and T (event-id tombstone)
-// records remain readable. New A records commit one complete logical event
+// records remain readable. A records commit one complete logical event
 // operation: its authorized deletions/supersession and insertion replay together.
-// Framing: [type:u8][length:u32le][payload][crc32:u32le]. A checksums header
-// plus payload; legacy E/T checksum only payload, exactly as before.
+// S records are A/E records that carry their event's stream seq (see
+// "Streams"); H records keep a stream head across compaction. Unsequenced
+// A records are events stored before streams existed or by anonymous writers.
+// Framing: [type:u8][length:u32le][payload][crc32:u32le]. A/S/H checksum
+// header plus payload; legacy E/T checksum only payload, exactly as before.
 // An incomplete EOF tail is always truncated at boot (bytes past a torn
 // append are untrustworthy, even if a suffix decodes as a valid frame);
 // corrupt complete records are never discarded. Boot streams the log through
@@ -38,6 +41,8 @@ Stored :: struct {
 	anon:       bool, // admitted via the stranger doors, counts against g_anon_bytes
 	space_deletion: bool, // kind-5 with ["h", _] tags (see space_deletion_covers)
 	idx:        int, // position in g_order (swap-remove bookkeeping)
+	seq:        i64, // position in stream (0 = unsequenced: legacy or anonymous writer)
+	stream:     ^Stream, // nil when seq == 0
 }
 
 g_events: map[string]^Stored
@@ -47,7 +52,7 @@ g_deletion_refs: map[string]int // author+id of each retained ["e", id] -> reque
 g_tombs: int // tombstoned records currently wasting log bytes
 g_anon_bytes: int // retained wire bytes from anonymous (non-allowlisted) writers
 g_log_bytes: int // current log file size
-g_live_bytes: int // size compaction would write: live E records + retained T records
+g_live_bytes: int // size compaction would write: live E/S records + retained T records + H records
 
 // Stranger retention quotas. The per-event size fence lives in nostr.odin
 // (ANON_MAX_EVENT_BYTES); these bound the aggregate: kind-0 rotation across
@@ -58,6 +63,12 @@ ANON_MAX_TOTAL_BYTES :: 32 << 20
 ANON_MAX_GIFTS_PER_TARGET :: 64
 
 MAX_RECORD :: MAX_MESSAGE // same bound for acceptance, new writes and legacy replay
+// S payload: [mode u8: 'A' plan | 'E' insert][seq u64le][wire JSON]; the
+// prefix rides on top of the event bound, so a MAX_RECORD event stays legal.
+SEQ_PREFIX :: 9
+// H payload: [head u64le][stream key].
+HEAD_PREFIX :: 8
+MAX_PAYLOAD :: MAX_RECORD + SEQ_PREFIX
 COMPACT_MIN_TOMBS :: 1024
 // Online compaction: once the log is more than twice what compaction would
 // write AND at least this many bytes are dead, the next commit rewrites it.
@@ -66,11 +77,121 @@ RECORD_OVERHEAD :: 9 // [type][length:u32][...][crc32]
 // Boot replay window. Every complete record fits, so a record still
 // incomplete after a refill is a genuine EOF tear, exactly as in a whole-file read.
 REPLAY_BUFFER :: 4 << 20
-#assert(REPLAY_BUFFER >= MAX_RECORD + RECORD_OVERHEAD)
+#assert(REPLAY_BUFFER >= MAX_PAYLOAD + RECORD_OVERHEAD)
 // Tags of one event examined by plan_operation. A kind-5 over this bound is
 // REJECTED rather than partially applied: a silently truncated deletion
 // leaves the client believing the relay dropped events it still serves.
 MAX_PLAN_TAGS :: 256
+
+// -- Streams (relay cursor) -------------------------------------------
+//
+// Every event stored by a non-anonymous writer takes the next seq of its
+// stream: the first ["s", T] tag names the space stream "s:T", otherwise the
+// author's personal stream "p:<pubkey>". Seqs are gap-free and never reused:
+// the head only grows (deleted and superseded events keep theirs consumed),
+// S records carry each seq and compaction writes every head as an H record.
+// Anonymous (stranger-door) events stay unsequenced: their throwaway keys
+// would otherwise each leave a permanent stream head behind.
+
+Stream_Slot :: struct {
+	seq: i64,
+	s:   ^Stored, // nil once evicted; seq stays for the binary search
+}
+
+Stream :: struct {
+	key:   string,
+	head:  i64, // highest seq ever assigned
+	slots: [dynamic]Stream_Slot, // ascending seq
+	lo:    int, // slots[:lo] are all evicted: slots[lo] is the oldest kept
+	holes: int, // evicted slots still present in slots
+}
+
+Stream_Cursor :: struct {
+	head:   i64,
+	oldest: i64, // oldest kept seq; head+1 when the stream keeps nothing
+}
+
+g_streams: map[string]^Stream
+
+// Rebuild a stream's slots once evicted holes are both numerous and the majority.
+STREAM_MIN_HOLES :: 64
+
+stream_key :: proc(ev: ^Event, allocator := context.temp_allocator) -> string {
+	for tag in ev.tags {
+		if len(tag) >= 2 && tag[0] == "s" do return strings.concatenate({"s:", tag[1]}, allocator)
+	}
+	return strings.concatenate({"p:", ev.pubkey}, allocator)
+}
+
+stream_get :: proc(key: string) -> ^Stream {
+	if st, ok := g_streams[key]; ok do return st
+	st := new(Stream)
+	st.key = strings.clone(key)
+	g_streams[st.key] = st
+	g_live_bytes += len(st.key) + HEAD_PREFIX + RECORD_OVERHEAD
+	return st
+}
+
+stream_cursor :: proc(st: ^Stream) -> Stream_Cursor {
+	if st == nil do return {head = 0, oldest = 1}
+	return {head = st.head, oldest = st.lo < len(st.slots) ? st.slots[st.lo].seq : st.head + 1}
+}
+
+// First slot index with slot.seq >= seq.
+stream_search :: proc(st: ^Stream, seq: i64) -> int {
+	lo, hi := 0, len(st.slots)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if st.slots[mid].seq < seq do lo = mid + 1
+		else do hi = mid
+	}
+	return lo
+}
+
+stream_has :: proc(st: ^Stream, seq: i64) -> bool {
+	i := stream_search(st, seq)
+	return i < len(st.slots) && st.slots[i].seq == seq
+}
+
+// Writes and replayed operations arrive in seq order and append; compacted
+// logs list each stream in seq order too, so the insertion is a fallback.
+stream_insert :: proc(st: ^Stream, s: ^Stored) {
+	n := len(st.slots)
+	if n == 0 || st.slots[n-1].seq < s.seq {
+		append(&st.slots, Stream_Slot{s.seq, s})
+		return
+	}
+	i := stream_search(st, s.seq)
+	inject_at(&st.slots, i, Stream_Slot{s.seq, s})
+	if i <= st.lo do st.lo = i
+}
+
+stream_remove :: proc(st: ^Stream, s: ^Stored) {
+	i := stream_search(st, s.seq)
+	assert(i < len(st.slots) && st.slots[i].s == s)
+	st.slots[i].s = nil
+	st.holes += 1
+	for st.lo < len(st.slots) && st.slots[st.lo].s == nil do st.lo += 1
+	if st.holes < STREAM_MIN_HOLES || 2*st.holes <= len(st.slots) do return
+	kept := 0
+	for slot in st.slots {
+		if slot.s == nil do continue
+		st.slots[kept] = slot
+		kept += 1
+	}
+	resize(&st.slots, kept)
+	st.lo, st.holes = 0, 0
+}
+
+u64le_put :: proc(dst: []u8, v: u64) {
+	for i in 0..<8 do dst[i] = u8(v >> uint(8*i))
+}
+
+u64le_get :: proc(src: []u8) -> u64 {
+	v: u64
+	for i in 0..<8 do v |= u64(src[i]) << uint(8*i)
+	return v
+}
 
 // -- Kind routing (unchanged) -----------------------------------------
 
@@ -101,28 +222,57 @@ write_full :: proc(fd: ^os.File, data: []u8) -> bool {
 	return true
 }
 
-write_record_to :: proc(fd: ^os.File, type: u8, payload: string) -> bool {
-	if len(payload) <= 0 || len(payload) > MAX_RECORD do return false
-	head: [5]u8
-	head[0] = type
-	n := u32(len(payload))
-	for i in 0..<4 do head[i+1] = u8(n >> uint(8*i))
-	seed := type == 'A' ? hash.crc32(head[:]) : u32(0)
-	crc := hash.crc32(transmute([]u8)payload, seed)
-	tail: [4]u8
-	for i in 0..<4 do tail[i] = u8(crc >> uint(8*i))
-	return write_full(fd, head[:]) && write_full(fd, transmute([]u8)payload) && write_full(fd, tail[:])
+// Legacy E/T checksum only their payload.
+record_crc_covers_header :: proc(type: u8) -> bool {
+	return type == 'A' || type == 'S' || type == 'H'
 }
 
-append_operation :: proc(wire: string) -> bool {
+record_max_payload :: proc(type: u8) -> int {
+	return type == 'S' || type == 'H' ? MAX_PAYLOAD : MAX_RECORD
+}
+
+// The record payload is prefix ++ payload; the prefix (S/H headers) is
+// framed in place rather than copied in front of a large event.
+write_record_to :: proc(fd: ^os.File, type: u8, payload: string, prefix: []u8 = nil) -> bool {
+	size := len(prefix) + len(payload)
+	if size <= 0 || size > record_max_payload(type) do return false
+	head: [5]u8
+	head[0] = type
+	n := u32(size)
+	for i in 0..<4 do head[i+1] = u8(n >> uint(8*i))
+	seed := record_crc_covers_header(type) ? hash.crc32(head[:]) : u32(0)
+	crc := hash.crc32(transmute([]u8)payload, hash.crc32(prefix, seed))
+	tail: [4]u8
+	for i in 0..<4 do tail[i] = u8(crc >> uint(8*i))
+	return write_full(fd, head[:]) && write_full(fd, prefix) && write_full(fd, transmute([]u8)payload) && write_full(fd, tail[:])
+}
+
+// S record of an event and its seq; mode 'A' replays as an operation (plan
+// then apply), 'E' as a plain insert (compaction output).
+write_sequenced_to :: proc(fd: ^os.File, mode: u8, seq: i64, wire: string) -> bool {
+	prefix: [SEQ_PREFIX]u8
+	prefix[0] = mode
+	u64le_put(prefix[1:], u64(seq))
+	return write_record_to(fd, 'S', wire, prefix[:])
+}
+
+write_head_to :: proc(fd: ^os.File, st: ^Stream) -> bool {
+	prefix: [HEAD_PREFIX]u8
+	u64le_put(prefix[:], u64(st.head))
+	return write_record_to(fd, 'H', st.key, prefix[:])
+}
+
+// seq > 0 logs a sequenced operation (S, mode A); 0 an unsequenced A.
+append_operation :: proc(wire: string, seq: i64 = 0) -> bool {
 	if g_append_failed || g_fd == nil do return false
-	if !write_record_to(g_fd, 'A', wire) || os.sync(g_fd) != nil {
+	written := seq > 0 ? write_sequenced_to(g_fd, 'A', seq, wire) : write_record_to(g_fd, 'A', wire)
+	if !written || os.sync(g_fd) != nil {
 		// Never append beyond a possibly partial/unsynced operation. Restart
 		// replays the file before any writer may use it again.
 		g_append_failed = true
 		return false
 	}
-	g_log_bytes += len(wire) + RECORD_OVERHEAD
+	g_log_bytes += len(wire) + RECORD_OVERHEAD + (seq > 0 ? SEQ_PREFIX : 0)
 	return true
 }
 
@@ -146,8 +296,9 @@ retained_tag :: proc(tag: []string) -> bool {
 	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
 }
 
+// seq > 0 places the event in its stream (stream_key) and advances the head.
 @(private)
-intern :: proc(ev: ^Event, wire_json: string) -> ^Stored {
+intern :: proc(ev: ^Event, wire_json: string, seq: i64 = 0) -> ^Stored {
 	s := new(Stored)
 	s.id = strings.clone(ev.id)
 	s.pubkey = strings.clone(ev.pubkey)
@@ -173,6 +324,13 @@ intern :: proc(ev: ^Event, wire_json: string) -> ^Stored {
 	s.space_deletion = is_space_deletion(ev)
 	if s.anon do g_anon_bytes += len(s.json)
 	g_live_bytes += len(s.json) + RECORD_OVERHEAD
+	if seq > 0 {
+		s.seq = seq
+		s.stream = stream_get(stream_key(ev))
+		s.stream.head = max(s.stream.head, seq)
+		stream_insert(s.stream, s)
+		g_live_bytes += SEQ_PREFIX
+	}
 
 	s.idx = len(g_order)
 	append(&g_order, s)
@@ -226,6 +384,10 @@ evict :: proc(s: ^Stored) {
 
 	if s.anon do g_anon_bytes -= len(s.json)
 	g_live_bytes -= len(s.json) + RECORD_OVERHEAD
+	if s.stream != nil {
+		stream_remove(s.stream, s)
+		g_live_bytes -= SEQ_PREFIX
+	}
 	delete(s.id)
 	delete(s.pubkey)
 	for t in s.tags {
@@ -244,6 +406,7 @@ store_open :: proc(path: string) {
 	g_log_path = strings.clone(path)
 	g_events = make(map[string]^Stored)
 	g_deleted = make(map[string]bool)
+	g_streams = make(map[string]^Stream)
 	g_append_failed = false
 	g_live_bytes = 0
 	g_log_bytes = 0
@@ -279,7 +442,7 @@ store_open :: proc(path: string) {
 		fmt.eprintln("[relay] FATAL: no appendable log")
 		os.exit(1)
 	}
-	fmt.printfln("[relay] store: %d live events, %d retained deleted IDs", len(g_order), len(g_deleted))
+	fmt.printfln("[relay] store: %d live events, %d retained deleted IDs, %d streams", len(g_order), len(g_deleted), len(g_streams))
 }
 
 Record_Status :: enum { Complete, Incomplete, Corrupt }
@@ -287,16 +450,17 @@ Record_Status :: enum { Complete, Incomplete, Corrupt }
 decode_record :: proc(data: []u8) -> (type: u8, payload: []u8, size: int, status: Record_Status) {
 	if len(data) == 0 do return 0, nil, 0, .Incomplete
 	type = data[0]
-	if type != 'E' && type != 'T' && type != 'A' do return type, nil, 0, .Corrupt
+	if type != 'E' && type != 'T' && type != 'A' && type != 'S' && type != 'H' do return type, nil, 0, .Corrupt
 	if len(data) < 5 do return type, nil, 0, .Incomplete
 	n := int(data[1]) | int(data[2]) << 8 | int(data[3]) << 16 | int(data[4]) << 24
-	if n <= 0 || n > MAX_RECORD || (type == 'T' && n != 64) do return type, nil, 0, .Corrupt
+	if n <= 0 || n > record_max_payload(type) || (type == 'T' && n != 64) do return type, nil, 0, .Corrupt
+	if (type == 'S' && n <= SEQ_PREFIX) || (type == 'H' && n <= HEAD_PREFIX) do return type, nil, 0, .Corrupt
 	size = n + 9
 	if size > len(data) do return type, nil, size, .Incomplete
 	payload = data[5:5+n]
 	c := data[5+n:size]
 	want := u32(c[0]) | u32(c[1]) << 8 | u32(c[2]) << 16 | u32(c[3]) << 24
-	seed := type == 'A' ? hash.crc32(data[:5]) : u32(0)
+	seed := record_crc_covers_header(type) ? hash.crc32(data[:5]) : u32(0)
 	if hash.crc32(payload, seed) != want do return type, payload, size, .Corrupt
 	return type, payload, size, .Complete
 }
@@ -369,16 +533,36 @@ replay_source :: proc(src: ^Log_Source) -> (good: int, status: Record_Status) {
 			if !is_hex64(string(payload)) do return good, .Corrupt
 			remember_deleted(string(payload))
 			if s, have := g_events[string(payload)]; have do evict(s)
+		} else if type == 'H' {
+			head := u64le_get(payload[:HEAD_PREFIX])
+			if head == 0 || head > u64(max(i64)) do return good, .Corrupt
+			st := stream_get(string(payload[HEAD_PREFIX:]))
+			st.head = max(st.head, i64(head))
 		} else {
-			v, jerr := json.parse(payload, .JSON, false, context.temp_allocator)
+			mode, seq, wire := type, i64(0), payload
+			if type == 'S' {
+				mode = payload[0]
+				raw_seq := u64le_get(payload[1:SEQ_PREFIX])
+				if mode != 'A' && mode != 'E' || raw_seq == 0 || raw_seq > u64(max(i64)) do return good, .Corrupt
+				seq, wire = i64(raw_seq), payload[SEQ_PREFIX:]
+			}
+			v, jerr := json.parse(wire, .JSON, false, context.temp_allocator)
 			if jerr != nil do return good, .Corrupt
 			ev, perr := parse_event(v)
 			if perr != "" do return good, .Corrupt
-			if type == 'A' {
+			if seq > 0 {
+				// Operations were logged in seq order; compacted inserts sit at
+				// or below their H head but never twice in one stream.
+				st := stream_get(stream_key(&ev))
+				if mode == 'A' ? seq <= st.head : stream_has(st, seq) do return good, .Corrupt
+				// Consumed even if the event no longer applies: never reused.
+				st.head = max(st.head, seq)
+			}
+			if mode == 'A' {
 				victims, message, _ := plan_operation(&ev)
-				if message == "" do apply_operation(&ev, string(payload), victims[:])
+				if message == "" do apply_operation(&ev, string(wire), victims[:], seq)
 			} else if !(ev.id in g_events) && !(ev.id in g_deleted) {
-				_ = intern(&ev, string(payload))
+				_ = intern(&ev, string(wire), seq)
 			}
 		}
 		good += size
@@ -419,12 +603,24 @@ replace_log :: proc(prefix: []u8, compacting: bool) -> bool {
 	if !opened do return false
 	ok := true
 	if compacting {
+		// Tombstones, then every stream head (seqs of evicted events stay
+		// consumed), then unsequenced events, then each stream in seq order
+		// so replay appends to its slots.
 		for id in g_deleted {
 			if !write_record_to(fd, 'T', id) { ok = false; break }
 		}
-		if ok {
-			for s in g_order {
-				if !write_record_to(fd, 'E', s.json) { ok = false; break }
+		for _, st in g_streams {
+			if !ok do break
+			ok = write_head_to(fd, st)
+		}
+		for s in g_order {
+			if !ok do break
+			if s.seq == 0 do ok = write_record_to(fd, 'E', s.json)
+		}
+		for _, st in g_streams {
+			for slot in st.slots[st.lo:] {
+				if !ok do break
+				if slot.s != nil do ok = write_sequenced_to(fd, 'E', slot.seq, slot.s.json)
 			}
 		}
 	} else {
@@ -632,9 +828,9 @@ plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: strin
 	return victims, "", false
 }
 
-apply_operation :: proc(ev: ^Event, wire: string, victims: []^Stored) {
+apply_operation :: proc(ev: ^Event, wire: string, victims: []^Stored, seq: i64 = 0) {
 	for s in victims do evict(s)
-	_ = intern(ev, wire)
+	_ = intern(ev, wire, seq)
 }
 
 // Anonymous gift wraps are bounded per recipient: once a resident holds
@@ -661,7 +857,8 @@ gift_inbox_full :: proc(ev: ^Event) -> bool {
 	return false
 }
 
-store_event :: proc(ev: ^Event) -> (ok: bool, message: string) {
+// seq_out receives the stored event's stream seq (0 when unsequenced).
+store_event :: proc(ev: ^Event, seq_out: ^i64 = nil) -> (ok: bool, message: string) {
 	sync.lock(&g_mu)
 	defer sync.unlock(&g_mu)
 	if g_append_failed do return false, "error: storage requires recovery"
@@ -673,15 +870,24 @@ store_event :: proc(ev: ^Event) -> (ok: bool, message: string) {
 	if gift_inbox_full(ev) do return false, "blocked: recipient gift inbox is full"
 	victims, msg, rejected := plan_operation(ev)
 	if msg != "" do return !rejected, msg
-	if anonymous_writer(ev) {
+	anon := anonymous_writer(ev)
+	if anon {
 		freed := 0
 		for s in victims do if s.anon do freed += len(s.json)
 		if g_anon_bytes - freed + len(wire) > ANON_MAX_TOTAL_BYTES {
 			return false, "blocked: anonymous storage quota exceeded"
 		}
 	}
-	if !append_operation(wire) do return false, "error: storage failure"
-	apply_operation(ev, wire, victims[:])
+	// Only a committed append consumes the seq: every rejection above and a
+	// failed append leave the head untouched, so the stream stays gap-free.
+	seq: i64 = 0
+	if !anon {
+		seq = 1
+		if st, have := g_streams[stream_key(ev)]; have do seq = st.head + 1
+	}
+	if !append_operation(wire, seq) do return false, "error: storage failure"
+	apply_operation(ev, wire, victims[:], seq)
+	if seq_out != nil do seq_out^ = seq
 	if ev.kind == 5 || ev.kind == ALLOWLIST_KIND do refresh_dynamic_allowlist_locked()
 	// The event is durable in the old log and live in memory, so it survives
 	// compaction (and its failure) either way.
@@ -694,12 +900,15 @@ store_event :: proc(ev: ^Event) -> (ok: bool, message: string) {
 Stored_Event :: struct {
 	id:   string,
 	json: string,
+	seq:  i64, // 0 when unsequenced
 }
 
 DEFAULT_LIMIT :: 500
 
 @(private = "file")
 matches :: proc(s: ^Stored, f: ^Filter) -> bool {
+	// after: exactly the named stream, past the cursor.
+	if f.has_after && (s.stream == nil || s.seq <= f.after || s.stream.key != f.stream) do return false
 	if len(f.ids) > 0 && !slice.contains(f.ids, s.id) do return false
 	if len(f.authors) > 0 && !slice.contains(f.authors, s.pubkey) do return false
 	if len(f.kinds) > 0 && !slice.contains(f.kinds, s.kind) do return false
@@ -727,15 +936,32 @@ stored_before :: proc(a, b: ^Stored) -> bool {
 	return a.id < b.id
 }
 
-// A worst-first heap retains at most MAX_LIMIT pointers regardless of total
-// matches. Clone only a byte-budgeted prefix after sorting those candidates.
-query_filter :: proc(f: ^Filter, byte_budget := MAX_QUERY_BYTES) -> (rows: []Stored_Event, exhausted: bool) {
+// Without `after`, a worst-first heap retains at most MAX_LIMIT pointers
+// regardless of total matches, newest first. With `after`, the stream's
+// slots past the cursor are already in ascending seq order and the first
+// `limit` matches are the page. Clone only a byte-budgeted prefix. cursor,
+// when given, receives the after stream's head and oldest kept seq from the
+// same locked snapshot as the rows (limit 0 returns just the cursor).
+query_filter :: proc(f: ^Filter, byte_budget := MAX_QUERY_BYTES, cursor: ^Stream_Cursor = nil) -> (rows: []Stored_Event, exhausted: bool) {
 	sync.lock(&g_mu)
 	defer sync.unlock(&g_mu)
 	limit := int(f.has_limit || f.limit > 0 ? f.limit : DEFAULT_LIMIT)
 	limit = clamp(limit, 0, MAX_LIMIT)
-	if limit == 0 do return nil, false
 	storage: [MAX_LIMIT]^Stored
+	if f.has_after {
+		st := g_streams[f.stream]
+		if cursor != nil do cursor^ = stream_cursor(st)
+		if st == nil || limit == 0 || f.after >= st.head do return nil, false
+		count := 0
+		for i := max(stream_search(st, f.after + 1), st.lo); i < len(st.slots) && count < limit; i += 1 {
+			s := st.slots[i].s
+			if s == nil || !matches(s, f) do continue
+			storage[count] = s
+			count += 1
+		}
+		return budgeted_rows(storage[:count], byte_budget)
+	}
+	if limit == 0 do return nil, false
 	count := 0
 	for s in g_order {
 		if !matches(s, f) do continue
@@ -763,6 +989,13 @@ query_filter :: proc(f: ^Filter, byte_budget := MAX_QUERY_BYTES) -> (rows: []Sto
 	}
 	hits := storage[:count]
 	slice.sort_by(hits, stored_before)
+	return budgeted_rows(hits, byte_budget)
+}
+
+// Clones the longest prefix of hits that fits byte_budget; exhausted when
+// that prefix is shorter than hits.
+@(private = "file")
+budgeted_rows :: proc(hits: []^Stored, byte_budget: int) -> (rows: []Stored_Event, exhausted: bool) {
 	bytes := 0
 	returned := 0
 	for s in hits {
@@ -773,7 +1006,7 @@ query_filter :: proc(f: ^Filter, byte_budget := MAX_QUERY_BYTES) -> (rows: []Sto
 	}
 	rows = make([]Stored_Event, returned, context.temp_allocator)
 	for s, i in hits[:returned] {
-		rows[i] = {id = strings.clone(s.id, context.temp_allocator), json = strings.clone(s.json, context.temp_allocator)}
+		rows[i] = {id = strings.clone(s.id, context.temp_allocator), json = strings.clone(s.json, context.temp_allocator), seq = s.seq}
 	}
 	return rows, exhausted
 }

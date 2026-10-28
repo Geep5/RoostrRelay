@@ -103,6 +103,48 @@ NIP-11 advertises it (`supported_features: ["blossom"]`, `blossom` object).
   `X-Forwarded-Proto` + `Host`, or `BLOSSOM_PUBLIC_URL` when set.
 - CORS allows `GET, HEAD, PUT, DELETE, OPTIONS` and the `Authorization` header.
 
+## Relay cursor (stream seq)
+
+Every event stored by an allowlisted writer (any writer on an open relay) gets
+a **seq** in one **stream**: its first `["s", T]` tag puts it in the space
+stream `T`, otherwise it is in its author's personal stream. Seqs start at 1 and
+are monotonic and gap-free per stream, never reused: deleted and superseded
+events keep theirs consumed, and an event that is not stored (duplicate, older
+replaceable version, rejected) takes none. Replaceable, addressable and kind-5
+events are sequenced like any other. Not sequenced: ephemeral kinds, events
+stored before the cursor existed, and stranger-door (non-allowlisted) events,
+whose throwaway keys would each leave a permanent stream head behind.
+
+- `REQ` filter field `after` (integer >= 0) reads one stream: exactly one `#s`
+  value (space stream; `authors` then only narrows it) or, without `#s`, exactly
+  one `authors` value (personal stream: that author's events with no `s` tag).
+  Anything else is `["CLOSED", sub, "invalid: after needs one stream"]` (NIP-77
+  answers `NEG-ERR` with the same reason). The result is the stream's events
+  with seq > `after` in **ascending seq order**, the first `limit` matches
+  (default 500, max 1000) after the other filter fields (`kinds`, tags,
+  `since`, ...). If the 8 MiB response budget cuts a page short, the delivered
+  prefix is kept and paging continues from its last seq; `CLOSED` only when
+  not even one event fits.
+- Subscriptions with at least one `after` filter get the seq on every
+  sequenced event, stored and live: `["EVENT", sub, event, {"seq": n}]`.
+  Their EOSE carries the stream cursor, read under the same lock as the page:
+  `["EOSE", sub, {"head": h, "oldest": o}]`, or for several streams one such
+  object per stream keyed by its `#s` value or author pubkey:
+  `["EOSE", sub, {"<T>": {"head": h, "oldest": o}, "<pubkey>": {...}}]`.
+  `head` is the highest seq assigned; `oldest` the lowest seq still stored
+  (`head + 1` when the stream keeps nothing; an unknown stream is
+  `{"head": 0, "oldest": 1}`). A client whose cursor is below `oldest - 1` is
+  behind the retention window. `limit: 0` returns just the EOSE cursor.
+- Live, an `after` filter matches only newly stored events of its stream with
+  seq > `after`; ephemeral events never match it.
+- Subscriptions without `after` are unchanged NIP-01: plain `EVENT`s, newest
+  first, and `["EOSE", sub]`.
+
+As for every subscription, an event committed while a `REQ` is between its
+query and its live registration can be delivered by neither or by both. Seqs
+are gap-free, so a client that sees one skipped re-requests `after` its last
+contiguous seq, and drops repeats by seq.
+
 ## Storage upgrades and recovery
 
 Back up the log before upgrading. The reader accepts legacy `E`/`T` records;
@@ -125,6 +167,20 @@ queries share; a failed online compaction latches writes closed until restart.
 Canonical history has no TTL.
 A space deletion is logged as its kind-5 alone; replay re-derives the same
 victims, so one `A` record removes a space of any size.
+
+Stream seqs (see Relay cursor) are persisted in the log itself, no side file:
+a sequenced event is an `S` record, `[mode][seq u64le][event JSON]` with mode
+`A` (operation, as above) or `E` (plain insert, compaction output), and
+compaction writes each stream's head as an `H` record, `[head u64le][stream]`,
+so the seqs of deleted events stay consumed. Both checksum header and payload
+like `A`. Replay restores every seq and head; an `S` operation at or below its
+stream head, or two events with one seq, is mid-log corruption. Existing logs
+need no migration: their `E`/`A` records load as unsequenced events and every
+stream starts at seq 1 with the first event the upgraded relay stores.
+
+**Never roll back to a pre-cursor binary against a log holding `S`/`H`
+records:** it fails startup with "corrupt log" (the file is left untouched).
+Restore a pre-upgrade backup, losing later writes, or upgrade again.
 
 **Never roll back to the pre-`A` binary against an upgraded log:** the old reader
 would treat new records as a torn tail. Restore a matching pre-upgrade backup or
