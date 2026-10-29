@@ -14,7 +14,8 @@ when ODIN_TEST {
 		seqs:       map[string]i64, // id -> stream seq (0 = unsequenced)
 		heads:      map[string]Stream_Cursor, // stream key -> head and oldest
 		deleted:    map[string]bool,
-		deletions:  int,
+		deletions:  int, // retained kind-5 requests
+		indexes:    [5]int, // plan index sizes: replay must rebuild the same keys
 		live_bytes: int, // exactly what compaction writes
 	}
 
@@ -24,6 +25,7 @@ when ODIN_TEST {
 		snap.heads = make(map[string]Stream_Cursor, context.temp_allocator)
 		snap.deleted = make(map[string]bool, context.temp_allocator)
 		for s in g_order {
+			if s.kind == 5 do snap.deletions += 1
 			id := strings.clone(s.id, context.temp_allocator)
 			snap.events[id] = strings.clone(s.json, context.temp_allocator)
 			snap.seqs[id] = s.seq
@@ -37,7 +39,7 @@ when ODIN_TEST {
 			snap.deleted[strings.clone(id, context.temp_allocator)] = true
 			snap.live_bytes += len(id) + RECORD_OVERHEAD
 		}
-		snap.deletions = len(g_deletions)
+		snap.indexes = {len(g_deletion_refs), len(g_address_deletions), len(g_space_deletions), len(g_addresses), len(g_spaces)}
 		return
 	}
 
@@ -47,6 +49,7 @@ when ODIN_TEST {
 		testing.expect_value(t, len(got.deleted), len(want.deleted), loc = loc)
 		testing.expect_value(t, len(got.heads), len(want.heads), loc = loc)
 		testing.expect_value(t, got.deletions, want.deletions, loc = loc)
+		testing.expect_value(t, got.indexes, want.indexes, loc = loc)
 		testing.expect_value(t, got.live_bytes, want.live_bytes, loc = loc)
 		// The incremental accounting agrees with a full recount.
 		testing.expect_value(t, g_live_bytes, got.live_bytes, loc = loc)

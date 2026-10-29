@@ -39,16 +39,39 @@ Stored :: struct {
 	tags:       [][2]string, // retained_tag subset: indexed single-letter tags + ["owner", pk]
 	json:       string, // wire JSON, echoed verbatim by REQ
 	anon:       bool, // admitted via the stranger doors, counts against g_anon_bytes
-	space_deletion: bool, // kind-5 with ["h", _] tags (see space_deletion_covers)
 	idx:        int, // position in g_order (swap-remove bookkeeping)
 	seq:        i64, // position in stream (0 = unsequenced: legacy or anonymous writer)
 	stream:     ^Stream, // nil when seq == 0
+	address:    ^Bucket, // g_addresses entry of a replaceable/addressable event, else nil
+	spaces:     []Space_Ref, // g_spaces entries, one per distinct ["h", T] (never for kind 5)
+}
+
+// Live events (or retained deletions) sharing one lookup key. Plans read
+// candidates from these instead of scanning g_order or every retained
+// deletion: replay plans every record, so either scan made boot
+// O(records x live events).
+Bucket :: struct {
+	key:     string,
+	members: [dynamic]^Stored,
+	newest:  i64, // g_address_deletions: latest created_at (cutoff) among members
+}
+
+// Position of a live event in one g_spaces bucket, for O(1) swap-removal.
+Space_Ref :: struct {
+	bucket: ^Bucket,
+	pos:    int,
 }
 
 g_events: map[string]^Stored
 g_order: [dynamic]^Stored
-g_deletions: [dynamic]^Stored // retained kind-5 requests, the only events that block arrivals
 g_deletion_refs: map[string]int // author+id of each retained ["e", id] -> request count
+// Retained kind-5 requests, the only events that block arrivals, indexed by
+// what they block: ["a", addr] (author's own addresses) and ["h", T] spaces.
+g_address_deletions: map[string]^Bucket // address_key -> requests naming it
+g_space_deletions: map[string]^Bucket // T -> space deletions with ["h", T]
+// Live supersession/deletion candidates.
+g_addresses: map[string]^Bucket // address_key -> live replaceable/addressable versions
+g_spaces: map[string]^Bucket // T -> live non-kind-5 events tagged ["h", T]
 g_tombs: int // tombstoned records currently wasting log bytes
 g_anon_bytes: int // retained wire bytes from anonymous (non-allowlisted) writers
 g_log_bytes: int // current log file size
@@ -231,35 +254,68 @@ record_max_payload :: proc(type: u8) -> int {
 	return type == 'S' || type == 'H' ? MAX_PAYLOAD : MAX_RECORD
 }
 
-// The record payload is prefix ++ payload; the prefix (S/H headers) is
-// framed in place rather than copied in front of a large event.
-write_record_to :: proc(fd: ^os.File, type: u8, payload: string, prefix: []u8 = nil) -> bool {
+// Header and CRC trailer of a record whose payload is prefix ++ payload.
+record_frame :: proc(type: u8, payload: string, prefix: []u8) -> (head: [5]u8, tail: [4]u8, ok: bool) {
 	size := len(prefix) + len(payload)
-	if size <= 0 || size > record_max_payload(type) do return false
-	head: [5]u8
+	if size <= 0 || size > record_max_payload(type) do return
 	head[0] = type
 	n := u32(size)
 	for i in 0..<4 do head[i+1] = u8(n >> uint(8*i))
 	seed := record_crc_covers_header(type) ? hash.crc32(head[:]) : u32(0)
 	crc := hash.crc32(transmute([]u8)payload, hash.crc32(prefix, seed))
-	tail: [4]u8
 	for i in 0..<4 do tail[i] = u8(crc >> uint(8*i))
-	return write_full(fd, head[:]) && write_full(fd, prefix) && write_full(fd, transmute([]u8)payload) && write_full(fd, tail[:])
+	return head, tail, true
 }
+
+// The prefix (S/H headers) is framed in place rather than copied in front
+// of a large event.
+write_record_fd :: proc(fd: ^os.File, type: u8, payload: string, prefix: []u8 = nil) -> bool {
+	head, tail, ok := record_frame(type, payload, prefix)
+	return ok && write_full(fd, head[:]) && write_full(fd, prefix) && write_full(fd, transmute([]u8)payload) && write_full(fd, tail[:])
+}
+
+// Compaction output: records gather in buf and reach fd in
+// COMPACT_WRITE_BUFFER writes, since several write calls per record
+// dominated boot compaction. ok latches the first failure.
+Log_Writer :: struct {
+	fd:  ^os.File,
+	buf: [dynamic]u8,
+	ok:  bool,
+}
+
+COMPACT_WRITE_BUFFER :: 1 << 20
+
+write_record_buffered :: proc(w: ^Log_Writer, type: u8, payload: string, prefix: []u8 = nil) -> bool {
+	head, tail, framed := record_frame(type, payload, prefix)
+	if !w.ok || !framed { w.ok = false; return false }
+	append(&w.buf, ..head[:])
+	append(&w.buf, ..prefix)
+	append(&w.buf, ..transmute([]u8)payload)
+	append(&w.buf, ..tail[:])
+	return len(w.buf) < COMPACT_WRITE_BUFFER || log_writer_flush(w)
+}
+
+log_writer_flush :: proc(w: ^Log_Writer) -> bool {
+	if w.ok do w.ok = write_full(w.fd, w.buf[:])
+	clear(&w.buf)
+	return w.ok
+}
+
+write_record_to :: proc{write_record_fd, write_record_buffered}
 
 // S record of an event and its seq; mode 'A' replays as an operation (plan
 // then apply), 'E' as a plain insert (compaction output).
-write_sequenced_to :: proc(fd: ^os.File, mode: u8, seq: i64, wire: string) -> bool {
+write_sequenced_to :: proc(out: $T, mode: u8, seq: i64, wire: string) -> bool {
 	prefix: [SEQ_PREFIX]u8
 	prefix[0] = mode
 	u64le_put(prefix[1:], u64(seq))
-	return write_record_to(fd, 'S', wire, prefix[:])
+	return write_record_to(out, 'S', wire, prefix[:])
 }
 
-write_head_to :: proc(fd: ^os.File, st: ^Stream) -> bool {
+write_head_to :: proc(out: $T, st: ^Stream) -> bool {
 	prefix: [HEAD_PREFIX]u8
 	u64le_put(prefix[:], u64(st.head))
-	return write_record_to(fd, 'H', st.key, prefix[:])
+	return write_record_to(out, 'H', st.key, prefix[:])
 }
 
 // seq > 0 logs a sequenced operation (S, mode A); 0 an unsequenced A.
@@ -321,7 +377,6 @@ intern :: proc(ev: ^Event, wire_json: string, seq: i64 = 0) -> ^Stored {
 		i += 1
 	}
 	s.anon = anonymous_writer(ev)
-	s.space_deletion = is_space_deletion(ev)
 	if s.anon do g_anon_bytes += len(s.json)
 	g_live_bytes += len(s.json) + RECORD_OVERHEAD
 	if seq > 0 {
@@ -334,39 +389,132 @@ intern :: proc(ev: ^Event, wire_json: string, seq: i64 = 0) -> ^Stored {
 
 	s.idx = len(g_order)
 	append(&g_order, s)
+	if is_replaceable(s.kind) || is_addressable(s.kind) {
+		s.address = bucket_add(&g_addresses, address_key(s.kind, s.pubkey, is_addressable(s.kind) ? s.d : ""), s)
+	}
 	if s.kind == 5 do index_deletion(s)
+	else do index_spaces(s)
 	g_events[s.id] = s
 	return s
 }
 
-// Arrivals look up e references instead of rescanning every retained
-// request's tags: boot replay plans each record, so that scan was
-// O(records x retained e tags).
-index_deletion :: proc(s: ^Stored) {
-	append(&g_deletions, s)
+// "kind:pubkey:d" with the kind in canonical decimal: equal keys exactly
+// when deletion_tag_matches would compare the fields equal.
+address_key :: proc(kind: i64, pubkey, d: string, allocator := context.temp_allocator) -> string {
+	buf: [24]u8
+	return strings.concatenate({strconv.write_int(buf[:], kind, 10), ":", pubkey, ":", d}, allocator)
+}
+
+bucket_add :: proc(index: ^map[string]^Bucket, key: string, s: ^Stored) -> ^Bucket {
+	b := index^[key]
+	if b == nil {
+		b = new(Bucket)
+		b.key = strings.clone(key)
+		index^[b.key] = b
+	}
+	append(&b.members, s)
+	return b
+}
+
+// Swap-removes b.members[pos]; moved is the member now at pos (nil when pos
+// was last). An emptied bucket leaves the index and is freed.
+bucket_take :: proc(index: ^map[string]^Bucket, b: ^Bucket, pos: int) -> (moved: ^Stored) {
+	last := pop(&b.members)
+	if pos < len(b.members) {
+		b.members[pos] = last
+		moved = last
+	}
+	if len(b.members) == 0 {
+		delete_key(index, b.key)
+		delete(b.key)
+		delete(b.members)
+		free(b)
+	}
+	return
+}
+
+// For buckets that stay small (one live version per address) or change
+// rarely (retained deletions are only evicted by legacy T records). false
+// when the bucket emptied and was freed.
+bucket_remove :: proc(index: ^map[string]^Bucket, b: ^Bucket, s: ^Stored) -> (survives: bool) {
+	for m, i in b.members {
+		if m != s do continue
+		survives = len(b.members) > 1
+		bucket_take(index, b, i)
+		return
+	}
+	panic("bucket_remove: not a member")
+}
+
+// Space deletions never cover kind 5, so only other kinds enter g_spaces.
+// Each distinct T is indexed once: a repeated ["h", T] finds s already
+// appended last in T's bucket.
+index_spaces :: proc(s: ^Stored) {
+	refs := make([dynamic]Space_Ref, context.temp_allocator)
 	for t in s.tags {
-		if t[0] != "e" do continue
-		key := strings.concatenate({s.pubkey, t[1]})
-		if key in g_deletion_refs {
-			g_deletion_refs[key] += 1
-			delete(key)
-		} else {
-			g_deletion_refs[key] = 1
+		if t[0] != "h" do continue
+		if b := g_spaces[t[1]]; b != nil && b.members[len(b.members)-1] == s do continue
+		b := bucket_add(&g_spaces, t[1], s)
+		append(&refs, Space_Ref{b, len(b.members) - 1})
+	}
+	if len(refs) > 0 do s.spaces = slice.clone(refs[:])
+}
+
+unindex_spaces :: proc(s: ^Stored) {
+	for r in s.spaces {
+		moved := bucket_take(&g_spaces, r.bucket, r.pos)
+		if moved == nil do continue
+		for &m in moved.spaces {
+			if m.bucket == r.bucket { m.pos = r.pos; break }
+		}
+	}
+	delete(s.spaces)
+}
+
+// A retained request blocks arrivals through its e references (here), its
+// own addresses (g_address_deletions) and its spaces (g_space_deletions),
+// so an arrival never rescans every retained request.
+index_deletion :: proc(s: ^Stored) {
+	for t in s.tags {
+		switch t[0] {
+		case "e":
+			key := strings.concatenate({s.pubkey, t[1]})
+			if key in g_deletion_refs {
+				g_deletion_refs[key] += 1
+				delete(key)
+			} else {
+				g_deletion_refs[key] = 1
+			}
+		case "a":
+			kind, author, d, ok := parse_address(t[1])
+			if !ok || author != s.pubkey || !is_addressable(kind) do continue
+			b := bucket_add(&g_address_deletions, address_key(kind, author, d), s)
+			b.newest = len(b.members) == 1 ? s.created_at : max(b.newest, s.created_at)
+		case "h":
+			bucket_add(&g_space_deletions, t[1], s)
 		}
 	}
 }
 
 unindex_deletion :: proc(s: ^Stored) {
-	for deletion, i in g_deletions {
-		if deletion == s { unordered_remove(&g_deletions, i); break }
-	}
 	for t in s.tags {
-		if t[0] != "e" do continue
-		key := strings.concatenate({s.pubkey, t[1]}, context.temp_allocator)
-		g_deletion_refs[key] -= 1
-		if g_deletion_refs[key] == 0 {
-			owned, _ := delete_key(&g_deletion_refs, key)
-			delete(owned)
+		switch t[0] {
+		case "e":
+			key := strings.concatenate({s.pubkey, t[1]}, context.temp_allocator)
+			g_deletion_refs[key] -= 1
+			if g_deletion_refs[key] == 0 {
+				owned, _ := delete_key(&g_deletion_refs, key)
+				delete(owned)
+			}
+		case "a":
+			kind, author, d, ok := parse_address(t[1])
+			if !ok || author != s.pubkey || !is_addressable(kind) do continue
+			b := g_address_deletions[address_key(kind, author, d)]
+			if !bucket_remove(&g_address_deletions, b, s) do continue
+			b.newest = b.members[0].created_at
+			for m in b.members do b.newest = max(b.newest, m.created_at)
+		case "h":
+			bucket_remove(&g_space_deletions, g_space_deletions[t[1]], s)
 		}
 	}
 }
@@ -380,6 +528,8 @@ evict :: proc(s: ^Stored) {
 	last.idx = s.idx
 	pop(&g_order)
 	if s.kind == 5 do unindex_deletion(s)
+	else do unindex_spaces(s)
+	if s.address != nil do bucket_remove(&g_addresses, s.address, s)
 	delete_key(&g_events, s.id)
 
 	if s.anon do g_anon_bytes -= len(s.json)
@@ -603,26 +753,29 @@ replace_log :: proc(prefix: []u8, compacting: bool) -> bool {
 	if !opened do return false
 	ok := true
 	if compacting {
+		w := Log_Writer{fd = fd, buf = make([dynamic]u8, 0, COMPACT_WRITE_BUFFER + MAX_PAYLOAD + RECORD_OVERHEAD), ok = true}
+		defer delete(w.buf)
 		// Tombstones, then every stream head (seqs of evicted events stay
 		// consumed), then unsequenced events, then each stream in seq order
 		// so replay appends to its slots.
 		for id in g_deleted {
-			if !write_record_to(fd, 'T', id) { ok = false; break }
+			if !write_record_to(&w, 'T', id) { ok = false; break }
 		}
 		for _, st in g_streams {
 			if !ok do break
-			ok = write_head_to(fd, st)
+			ok = write_head_to(&w, st)
 		}
 		for s in g_order {
 			if !ok do break
-			if s.seq == 0 do ok = write_record_to(fd, 'E', s.json)
+			if s.seq == 0 do ok = write_record_to(&w, 'E', s.json)
 		}
 		for _, st in g_streams {
 			for slot in st.slots[st.lo:] {
 				if !ok do break
-				if slot.s != nil do ok = write_sequenced_to(fd, 'E', slot.seq, slot.s.json)
+				if slot.s != nil do ok = write_sequenced_to(&w, 'E', slot.seq, slot.s.json)
 			}
 		}
+		ok = ok && log_writer_flush(&w)
 	} else {
 		ok = write_full(fd, prefix)
 	}
@@ -703,18 +856,23 @@ compact_online :: proc() {
 // could lose.
 
 // NIP-09 address identifiers may themselves contain colons. Split only the
-// kind and author fields; compare the remaining d value verbatim.
+// kind and author fields; the remaining d value is compared verbatim.
+parse_address :: proc(value: string) -> (kind: i64, author, d: string, ok: bool) {
+	first := strings.index(value, ":")
+	if first < 0 do return
+	rest := value[first+1:]
+	second := strings.index(rest, ":")
+	if second < 0 do return
+	k, kok := strconv.parse_int(value[:first])
+	return i64(k), rest[:second], rest[second+1:], kok
+}
+
 deletion_tag_matches :: proc(name, value, author: string, cutoff: i64, id, pubkey: string, kind: i64, d: string, created_at: i64) -> bool {
 	if pubkey != author || kind == 5 do return false
 	if name == "e" do return value == id
 	if name != "a" || !is_addressable(kind) || created_at > cutoff do return false
-	first := strings.index(value, ":")
-	if first < 0 do return false
-	rest := value[first+1:]
-	second := strings.index(rest, ":")
-	if second < 0 || rest[:second] != author || rest[second+1:] != d do return false
-	k, ok := strconv.parse_int(value[:first])
-	return ok && i64(k) == kind
+	k, a, ad, ok := parse_address(value)
+	return ok && a == author && ad == d && k == kind
 }
 
 tag_present :: proc(tags: []$T, name, value: string) -> bool {
@@ -758,26 +916,40 @@ space_deletion_covers :: proc(deletion: []$D, author: string, target: []$T, pubk
 	return in_space && (!restricted || kind_listed)
 }
 
+when ODIN_TEST {
+	// Retained requests and live candidates plan_operation examined; tests
+	// bound it per planned record.
+	g_plan_work: int
+}
+
+// Every lookup is indexed: replay plans each record, so a plan scanning the
+// store or the retained deletions made boot O(records x live events).
 plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: string, rejected: bool) {
 	if ev.id in g_events do return nil, "duplicate: already have this event", false
 	if ev.id in g_deleted do return nil, "blocked: event was deleted", true
 	// Hoisted out of every inner loop below: d_tag(ev) is a per-event scan.
 	ev_d := d_tag(ev)
 	ev_space_deletion := is_space_deletion(ev)
-	// Replay plans every record: arrivals consult the e-reference index and
-	// only retained deletions, and regular kinds (which displace nothing)
-	// skip the store scan below.
-	if ev.kind != 5 && strings.concatenate({ev.pubkey, ev.id}, context.temp_allocator) in g_deletion_refs {
-		return nil, "blocked: event was deleted", true
-	}
-	for deletion in g_deletions {
-		if deletion.space_deletion && space_deletion_covers(deletion.tags, deletion.pubkey, ev.tags, ev.pubkey, ev.kind) {
+	// Retained requests block by e reference, by the author's own address
+	// (cutoff: the newest request naming it) or by space. Deletions are
+	// never blocked: none of these match kind 5.
+	if ev.kind != 5 {
+		if strings.concatenate({ev.pubkey, ev.id}, context.temp_allocator) in g_deletion_refs {
 			return nil, "blocked: event was deleted", true
 		}
-		if deletion.pubkey != ev.pubkey || !is_addressable(ev.kind) do continue
-		for tag in deletion.tags {
-			if tag[0] == "a" && deletion_tag_matches(tag[0], tag[1], deletion.pubkey, deletion.created_at, ev.id, ev.pubkey, ev.kind, ev_d, ev.created_at) {
-				return nil, "blocked: event was deleted", true
+		if is_addressable(ev.kind) {
+			b := g_address_deletions[address_key(ev.kind, ev.pubkey, ev_d)]
+			if b != nil && ev.created_at <= b.newest do return nil, "blocked: event was deleted", true
+		}
+		for tag in ev.tags {
+			if len(tag) < 2 || tag[0] != "h" do continue
+			b := g_space_deletions[tag[1]]
+			if b == nil do continue
+			when ODIN_TEST do g_plan_work += len(b.members)
+			for deletion in b.members {
+				if space_deletion_covers(deletion.tags, deletion.pubkey, ev.tags, ev.pubkey, ev.kind) {
+					return nil, "blocked: event was deleted", true
+				}
 			}
 		}
 	}
@@ -788,14 +960,20 @@ plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: strin
 	// re-derives this same set, so one record removes a space of any size
 	// atomically. e tags name their events, so they are looked up; `named`
 	// keeps repeated e tags from producing duplicate pointers (and therefore
-	// double frees), and the store scan only runs for a/h tags.
-	scan := is_replaceable(ev.kind) || is_addressable(ev.kind) || ev_space_deletion
+	// double frees). Every other victim is among `candidates`: the versions
+	// at the event's own address, at a named address, or in a named space.
 	named := make(map[^Stored]bool, context.temp_allocator)
+	candidates := make([dynamic]^Stored, context.temp_allocator)
 	if ev.kind == 5 {
 		for tag, i in ev.tags {
 			if i >= MAX_PLAN_TAGS do break
 			if len(tag) < 2 do continue
-			if tag[0] == "a" do scan = true
+			if tag[0] == "a" {
+				kind, author, d, ok := parse_address(tag[1])
+				if !ok || author != ev.pubkey || !is_addressable(kind) do continue
+				if b := g_addresses[address_key(kind, author, d)]; b != nil do append(&candidates, ..b.members[:])
+				continue
+			}
 			if tag[0] != "e" do continue
 			s, stored := g_events[tag[1]]
 			if !stored || s in named do continue
@@ -804,11 +982,24 @@ plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: strin
 				append(&victims, s)
 			}
 		}
+		if ev_space_deletion {
+			for tag in ev.tags {
+				if len(tag) < 2 || tag[0] != "h" do continue
+				if b := g_spaces[tag[1]]; b != nil do append(&candidates, ..b.members[:])
+			}
+		}
+	} else if is_replaceable(ev.kind) || is_addressable(ev.kind) {
+		if b := g_addresses[address_key(ev.kind, ev.pubkey, is_addressable(ev.kind) ? ev_d : "")]; b != nil {
+			append(&candidates, ..b.members[:])
+		}
 	}
-	if !scan do return victims, "", false
+	// Store order, as a full g_order scan would visit them; a candidate
+	// found through several tags is adjacent after sorting.
+	slice.sort_by(candidates[:], proc(a, b: ^Stored) -> bool { return a.idx < b.idx })
+	when ODIN_TEST do g_plan_work += len(candidates)
 	d := is_addressable(ev.kind) ? ev_d : ""
-	for s in g_order {
-		if s in named do continue
+	for s, i in candidates {
+		if (i > 0 && candidates[i-1] == s) || s in named do continue
 		victim := false
 		if (is_replaceable(ev.kind) || is_addressable(ev.kind)) && s.pubkey == ev.pubkey && s.kind == ev.kind && (!is_addressable(ev.kind) || s.d == d) {
 			if s.created_at > ev.created_at || (s.created_at == ev.created_at && s.id < ev.id) {
@@ -818,8 +1009,8 @@ plan_operation :: proc(ev: ^Event) -> (victims: [dynamic]^Stored, message: strin
 		}
 		if ev.kind == 5 {
 			if ev_space_deletion && space_deletion_covers(ev.tags, ev.pubkey, s.tags, s.pubkey, s.kind) do victim = true
-			for tag, i in ev.tags {
-				if victim || i >= MAX_PLAN_TAGS do break
+			for tag, j in ev.tags {
+				if victim || j >= MAX_PLAN_TAGS do break
 				if len(tag) >= 2 && tag[0] == "a" && deletion_tag_matches(tag[0], tag[1], ev.pubkey, ev.created_at, s.id, s.pubkey, s.kind, s.d, s.created_at) do victim = true
 			}
 		}

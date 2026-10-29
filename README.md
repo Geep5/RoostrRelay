@@ -167,6 +167,10 @@ queries share; a failed online compaction latches writes closed until restart.
 Canonical history has no TTL.
 A space deletion is logged as its kind-5 alone; replay re-derives the same
 victims, so one `A` record removes a space of any size.
+Replay plans every operation record, so planning never scans the store or the
+retained deletions: live versions are indexed by address and live events by
+space, retained deletions by `e` reference, address and space. Boot replay is
+linear in the log, and compaction writes its output in 1 MiB batches.
 
 Stream seqs (see Relay cursor) are persisted in the log itself, no side file:
 a sequenced event is an `S` record, `[mode][seq u64le][event JSON]` with mode

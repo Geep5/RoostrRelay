@@ -23,17 +23,25 @@ when ODIN_TEST {
 		}
 		delete(g_streams)
 		g_streams = make(map[string]^Stream)
-		delete(g_deletions)
+		// Evicting every event emptied (and freed) every bucket.
+		delete(g_address_deletions)
+		delete(g_space_deletions)
+		delete(g_addresses)
+		delete(g_spaces)
 		delete(g_deletion_refs)
 		delete(g_events)
 		for id in g_deleted do delete(id)
 		delete(g_deleted)
 		g_order = nil
-		g_deletions = nil
+		g_address_deletions = nil
+		g_space_deletions = nil
+		g_addresses = nil
+		g_spaces = nil
 		g_deletion_refs = nil
 		g_events = make(map[string]^Stored)
 		g_deleted = make(map[string]bool)
 		g_tombs = 0
+		g_live_bytes = 0
 		g_anon_bytes = 0
 		g_append_failed = false
 	}
